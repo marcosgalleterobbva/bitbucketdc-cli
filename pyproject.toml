@@ -21,6 +21,9 @@ classifiers = [
   "Operating System :: OS Independent",
 ]
 
+[project.urls]
+Repository = "https://github.com/marcosgalleterobbva/bb-cli"
+
 [project.scripts]
 bbdc = "bbdc_cli.__main__:main"
 

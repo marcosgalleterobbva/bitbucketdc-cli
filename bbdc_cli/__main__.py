@@ -28,6 +28,7 @@ import json
 import os
 import sys
 from dataclasses import dataclass
+from urllib.parse import quote
 from typing import Any, Dict, Iterable, List, Optional
 
 import requests
@@ -36,8 +37,16 @@ import typer
 app = typer.Typer(no_args_is_help=True, add_completion=False)
 pr_app = typer.Typer(no_args_is_help=True, add_completion=False)
 participants_app = typer.Typer(no_args_is_help=True, add_completion=False)
+comments_app = typer.Typer(no_args_is_help=True, add_completion=False)
+blockers_app = typer.Typer(no_args_is_help=True, add_completion=False)
+review_app = typer.Typer(no_args_is_help=True, add_completion=False)
+auto_merge_app = typer.Typer(no_args_is_help=True, add_completion=False)
 app.add_typer(pr_app, name="pr", help="Pull request operations")
 pr_app.add_typer(participants_app, name="participants", help="PR participants and reviewers")
+pr_app.add_typer(comments_app, name="comments", help="PR comments")
+pr_app.add_typer(blockers_app, name="blockers", help="PR blocker comments")
+pr_app.add_typer(review_app, name="review", help="PR review workflow")
+pr_app.add_typer(auto_merge_app, name="auto-merge", help="PR auto-merge")
 
 
 class BBError(RuntimeError):
@@ -126,6 +135,53 @@ class BitbucketClient:
         if "application/json" in ctype:
             return resp.json()
         return {"raw": resp.text}
+
+    def request_rest(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        json_body: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        url = f"{self.base_rest}/{path.lstrip('/')}"
+        try:
+            resp = requests.request(
+                method=method.upper(),
+                url=url,
+                headers=self._headers("application/json" if json_body is not None else None),
+                params=params,
+                json=json_body,
+                timeout=self.timeout_s,
+            )
+        except requests.RequestException as e:
+            raise BBError(f"Request failed: {e}") from e
+
+        if resp.status_code >= 400:
+            # Best-effort error extraction
+            detail = ""
+            try:
+                j = resp.json()
+                if isinstance(j, dict):
+                    if "errors" in j and isinstance(j["errors"], list) and j["errors"]:
+                        # Bitbucket often returns: {"errors":[{"message": "..."}]}
+                        msg = j["errors"][0].get("message")
+                        if msg:
+                            detail = msg
+                    elif "message" in j and isinstance(j["message"], str):
+                        detail = j["message"]
+            except Exception:
+                pass
+            raise BBError(f"HTTP {resp.status_code} for {method} {url}" + (f": {detail}" if detail else ""))
+
+        if not resp.content:
+            return {}
+        # Some endpoints may return plain text; keep it robust
+        ctype = resp.headers.get("content-type", "")
+        if "application/json" in ctype:
+            return resp.json()
+        return {"raw": resp.text}
+
 
     def paged_get(
         self,
@@ -228,6 +284,8 @@ def _print_participants(items: Iterable[Dict[str, Any]]) -> None:
 
 ROLE_CHOICES = {"AUTHOR", "REVIEWER", "PARTICIPANT"}
 STATUS_CHOICES = {"UNAPPROVED", "NEEDS_WORK", "APPROVED"}
+COMMENT_STATE_CHOICES = {"OPEN", "RESOLVED"}
+COMMENT_SEVERITY_CHOICES = {"NORMAL", "BLOCKER"}
 
 
 def _norm_choice(value: str, allowed: set[str], name: str) -> str:
@@ -248,6 +306,38 @@ def _get_pr_version(bb: BitbucketClient, project: str, repo: str, pr_id: int) ->
         return int(version)
     except (TypeError, ValueError):
         raise BBError(f"Invalid PR version returned: {version}")
+
+
+def _print_raw(resp: Any) -> None:
+    if isinstance(resp, dict) and "raw" in resp:
+        typer.echo(resp["raw"])
+    else:
+        _print_json(resp)
+
+
+def _encode_path(path: str) -> str:
+    return quote(path, safe="/")
+
+
+def _get_comment_version(
+    bb: BitbucketClient,
+    project: str,
+    repo: str,
+    pr_id: int,
+    comment_id: int,
+    *,
+    blocker: bool = False,
+) -> int:
+    endpoint = "blocker-comments" if blocker else "comments"
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/{endpoint}/{comment_id}"
+    comment = bb.request("GET", path)
+    version = comment.get("version")
+    if version is None:
+        raise BBError("Could not determine comment version. Pass --version explicitly.")
+    try:
+        return int(version)
+    except (TypeError, ValueError):
+        raise BBError(f"Invalid comment version returned: {version}")
 
 
 @pr_app.command("list")
@@ -627,6 +717,727 @@ def pr_participants_status(
         _print_json(resp)
         return
     typer.echo(f"Updated {user} status to {status} on PR #{pr_id}")
+
+
+@participants_app.command("search")
+def pr_participants_search(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    filter: Optional[str] = typer.Option(None, "--filter", help="Filter by username, name, or email"),
+    role: Optional[str] = typer.Option(None, "--role", help="AUTHOR, REVIEWER, or PARTICIPANT"),
+    direction: Optional[str] = typer.Option(None, "--direction", help="INCOMING or OUTGOING"),
+    limit: int = typer.Option(50, help="Page size"),
+    max_items: int = typer.Option(200, help="Max items to fetch across pages"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON response"),
+):
+    """Search pull request participants in a repository."""
+    bb = client()
+    params: Dict[str, Any] = {}
+    if filter:
+        params["filter"] = filter
+    if role:
+        params["role"] = _norm_choice(role, ROLE_CHOICES, "role")
+    if direction:
+        params["direction"] = direction
+    path = f"projects/{project}/repos/{repo}/participants"
+    participants = bb.paged_get(path, params=params, limit=limit, max_items=max_items)
+    if json_out:
+        _print_json(participants)
+    else:
+        _print_participants(participants)
+
+
+@comments_app.command("add")
+def pr_comments_add(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+    text: str = typer.Option(..., "--text", "-t", help="Comment text"),
+):
+    """Add a comment to a pull request."""
+    pr_comment(project=project, repo=repo, pr_id=pr_id, text=text)
+
+
+@comments_app.command("list")
+def pr_comments_list(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+    file_path: str = typer.Option(..., "--path", help="File path to stream comments for"),
+    from_hash: Optional[str] = typer.Option(None, "--from-hash", help="From commit hash"),
+    to_hash: Optional[str] = typer.Option(None, "--to-hash", help="To commit hash"),
+    diff_types: Optional[str] = typer.Option(None, "--diff-types", help="Comma-separated diff types"),
+    states: Optional[str] = typer.Option(None, "--states", help="Comma-separated states (OPEN,RESOLVED)"),
+    anchor_state: Optional[str] = typer.Option(None, "--anchor-state", help="ACTIVE, ORPHANED, or ALL"),
+    limit: int = typer.Option(50, help="Page size"),
+    max_items: int = typer.Option(200, help="Max items to fetch across pages"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON response"),
+):
+    """List pull request comments for a file path."""
+    bb = client()
+    params: Dict[str, Any] = {"path": file_path}
+    if from_hash:
+        params["fromHash"] = from_hash
+    if to_hash:
+        params["toHash"] = to_hash
+    if diff_types:
+        params["diffTypes"] = diff_types
+    if states:
+        params["states"] = states
+    if anchor_state:
+        params["anchorState"] = anchor_state
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/comments"
+    comments = bb.paged_get(path, params=params, limit=limit, max_items=max_items)
+    if json_out:
+        _print_json(comments)
+    else:
+        _print_json(comments)
+
+
+@comments_app.command("get")
+def pr_comments_get(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+    comment_id: int = typer.Argument(..., help="Comment ID"),
+):
+    """Get a pull request comment."""
+    bb = client()
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/comments/{comment_id}"
+    resp = bb.request("GET", path)
+    _print_json(resp)
+
+
+@comments_app.command("update")
+def pr_comments_update(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+    comment_id: int = typer.Argument(..., help="Comment ID"),
+    text: Optional[str] = typer.Option(None, "--text", help="Updated comment text"),
+    severity: Optional[str] = typer.Option(None, "--severity", help="NORMAL or BLOCKER"),
+    state: Optional[str] = typer.Option(None, "--state", help="OPEN or RESOLVED"),
+    version: Optional[int] = typer.Option(None, "--version", help="Comment version (auto-fetched if omitted)"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON response"),
+):
+    """Update a pull request comment."""
+    if text is None and severity is None and state is None:
+        raise BBError("Nothing to update. Provide --text, --severity, or --state.")
+    bb = client()
+    if version is None:
+        version = _get_comment_version(bb, project, repo, pr_id, comment_id)
+    body: Dict[str, Any] = {"version": version}
+    if text is not None:
+        body["text"] = text
+    if severity is not None:
+        body["severity"] = _norm_choice(severity, COMMENT_SEVERITY_CHOICES, "severity")
+    if state is not None:
+        body["state"] = _norm_choice(state, COMMENT_STATE_CHOICES, "state")
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/comments/{comment_id}"
+    resp = bb.request("PUT", path, json_body=body)
+    if json_out:
+        _print_json(resp)
+    else:
+        typer.echo(f"Updated comment {comment_id} on PR #{pr_id}")
+
+
+@comments_app.command("delete")
+def pr_comments_delete(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+    comment_id: int = typer.Argument(..., help="Comment ID"),
+    version: Optional[int] = typer.Option(None, "--version", help="Comment version (auto-fetched if omitted)"),
+):
+    """Delete a pull request comment."""
+    bb = client()
+    if version is None:
+        version = _get_comment_version(bb, project, repo, pr_id, comment_id)
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/comments/{comment_id}"
+    bb.request("DELETE", path, params={"version": version})
+    typer.echo(f"Deleted comment {comment_id} on PR #{pr_id}")
+
+
+@comments_app.command("apply-suggestion")
+def pr_comments_apply_suggestion(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+    comment_id: int = typer.Argument(..., help="Comment ID"),
+    suggestion_index: int = typer.Option(..., "--suggestion-index", help="Suggestion index"),
+    comment_version: Optional[int] = typer.Option(None, "--comment-version", help="Comment version"),
+    pr_version: Optional[int] = typer.Option(None, "--pr-version", help="Pull request version"),
+    commit_message: str = typer.Option("", "--commit-message", help="Optional commit message"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON response"),
+):
+    """Apply a suggestion from a pull request comment."""
+    bb = client()
+    if comment_version is None:
+        comment_version = _get_comment_version(bb, project, repo, pr_id, comment_id)
+    if pr_version is None:
+        pr_version = _get_pr_version(bb, project, repo, pr_id)
+    body: Dict[str, Any] = {
+        "commentVersion": comment_version,
+        "pullRequestVersion": pr_version,
+        "suggestionIndex": suggestion_index,
+    }
+    if commit_message:
+        body["commitMessage"] = commit_message
+    path = (
+        f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/comments/{comment_id}/apply-suggestion"
+    )
+    resp = bb.request("POST", path, json_body=body)
+    if json_out:
+        _print_json(resp)
+    else:
+        typer.echo(f"Applied suggestion from comment {comment_id} on PR #{pr_id}")
+
+
+@comments_app.command("react")
+def pr_comments_react(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+    comment_id: int = typer.Argument(..., help="Comment ID"),
+    emoticon: str = typer.Option(..., "--emoticon", help="Reaction emoticon (e.g. :+1:)"),
+):
+    """React to a pull request comment."""
+    bb = client()
+    path = (
+        f"comment-likes/latest/projects/{project}/repos/{repo}/pull-requests/{pr_id}"
+        f"/comments/{comment_id}/reactions/{emoticon}"
+    )
+    bb.request_rest("PUT", path)
+    typer.echo(f"Reacted to comment {comment_id} on PR #{pr_id}")
+
+
+@comments_app.command("unreact")
+def pr_comments_unreact(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+    comment_id: int = typer.Argument(..., help="Comment ID"),
+    emoticon: str = typer.Option(..., "--emoticon", help="Reaction emoticon (e.g. :+1:)"),
+):
+    """Remove a reaction from a pull request comment."""
+    bb = client()
+    path = (
+        f"comment-likes/latest/projects/{project}/repos/{repo}/pull-requests/{pr_id}"
+        f"/comments/{comment_id}/reactions/{emoticon}"
+    )
+    bb.request_rest("DELETE", path)
+    typer.echo(f"Removed reaction from comment {comment_id} on PR #{pr_id}")
+
+
+@blockers_app.command("list")
+def pr_blockers_list(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+    states: Optional[str] = typer.Option(None, "--states", help="Comma-separated states (OPEN,RESOLVED)"),
+    count: bool = typer.Option(False, "--count", help="Return counts only"),
+    limit: int = typer.Option(50, help="Page size"),
+    max_items: int = typer.Option(200, help="Max items to fetch across pages"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON response"),
+):
+    """List blocker comments for a pull request."""
+    bb = client()
+    params: Dict[str, Any] = {}
+    if states:
+        params["states"] = states
+    if count:
+        params["count"] = "true"
+        resp = bb.request(
+            "GET", f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/blocker-comments", params=params
+        )
+        if json_out:
+            _print_json(resp)
+        else:
+            _print_json(resp)
+        return
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/blocker-comments"
+    comments = bb.paged_get(path, params=params, limit=limit, max_items=max_items)
+    if json_out:
+        _print_json(comments)
+    else:
+        _print_json(comments)
+
+
+@blockers_app.command("add")
+def pr_blockers_add(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+    text: str = typer.Option(..., "--text", "-t", help="Comment text"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON response"),
+):
+    """Add a blocker comment to a pull request."""
+    bb = client()
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/blocker-comments"
+    body = {"text": text}
+    resp = bb.request("POST", path, json_body=body)
+    if json_out:
+        _print_json(resp)
+    else:
+        comment_id = resp.get("id", "?")
+        typer.echo(f"Added blocker comment {comment_id} to PR #{pr_id}")
+
+
+@blockers_app.command("get")
+def pr_blockers_get(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+    comment_id: int = typer.Argument(..., help="Comment ID"),
+):
+    """Get a blocker comment."""
+    bb = client()
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/blocker-comments/{comment_id}"
+    resp = bb.request("GET", path)
+    _print_json(resp)
+
+
+@blockers_app.command("update")
+def pr_blockers_update(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+    comment_id: int = typer.Argument(..., help="Comment ID"),
+    text: Optional[str] = typer.Option(None, "--text", help="Updated comment text"),
+    severity: Optional[str] = typer.Option(None, "--severity", help="NORMAL or BLOCKER"),
+    state: Optional[str] = typer.Option(None, "--state", help="OPEN or RESOLVED"),
+    version: Optional[int] = typer.Option(None, "--version", help="Comment version (auto-fetched if omitted)"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON response"),
+):
+    """Update a blocker comment."""
+    if text is None and severity is None and state is None:
+        raise BBError("Nothing to update. Provide --text, --severity, or --state.")
+    bb = client()
+    if version is None:
+        version = _get_comment_version(bb, project, repo, pr_id, comment_id, blocker=True)
+    body: Dict[str, Any] = {"version": version}
+    if text is not None:
+        body["text"] = text
+    if severity is not None:
+        body["severity"] = _norm_choice(severity, COMMENT_SEVERITY_CHOICES, "severity")
+    if state is not None:
+        body["state"] = _norm_choice(state, COMMENT_STATE_CHOICES, "state")
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/blocker-comments/{comment_id}"
+    resp = bb.request("PUT", path, json_body=body)
+    if json_out:
+        _print_json(resp)
+    else:
+        typer.echo(f"Updated blocker comment {comment_id} on PR #{pr_id}")
+
+
+@blockers_app.command("delete")
+def pr_blockers_delete(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+    comment_id: int = typer.Argument(..., help="Comment ID"),
+    version: Optional[int] = typer.Option(None, "--version", help="Comment version (auto-fetched if omitted)"),
+):
+    """Delete a blocker comment."""
+    bb = client()
+    if version is None:
+        version = _get_comment_version(bb, project, repo, pr_id, comment_id, blocker=True)
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/blocker-comments/{comment_id}"
+    bb.request("DELETE", path, params={"version": version})
+    typer.echo(f"Deleted blocker comment {comment_id} on PR #{pr_id}")
+
+
+@review_app.command("get")
+def pr_review_get(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+):
+    """Get pull request review thread."""
+    bb = client()
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/review"
+    resp = bb.request("GET", path)
+    _print_json(resp)
+
+
+@review_app.command("complete")
+def pr_review_complete(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+    comment_text: Optional[str] = typer.Option(None, "--comment", help="General review comment"),
+    last_reviewed_commit: Optional[str] = typer.Option(
+        None, "--last-reviewed-commit", help="Commit hash last reviewed"
+    ),
+    status: Optional[str] = typer.Option(None, "--status", help="UNAPPROVED, NEEDS_WORK, or APPROVED"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON response"),
+):
+    """Complete a pull request review."""
+    if comment_text is None and last_reviewed_commit is None and status is None:
+        raise BBError("Nothing to update. Provide --comment, --last-reviewed-commit, or --status.")
+    bb = client()
+    body: Dict[str, Any] = {}
+    if comment_text is not None:
+        body["commentText"] = comment_text
+    if last_reviewed_commit is not None:
+        body["lastReviewedCommit"] = last_reviewed_commit
+    if status is not None:
+        body["participantStatus"] = _norm_choice(status, STATUS_CHOICES, "status")
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/review"
+    resp = bb.request("PUT", path, json_body=body)
+    if json_out:
+        _print_json(resp)
+    else:
+        typer.echo(f"Completed review for PR #{pr_id}")
+
+
+@review_app.command("discard")
+def pr_review_discard(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+):
+    """Discard pull request review."""
+    bb = client()
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/review"
+    bb.request("DELETE", path)
+    typer.echo(f"Discarded review for PR #{pr_id}")
+
+
+@auto_merge_app.command("get")
+def pr_auto_merge_get(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+):
+    """Get auto-merge request for a pull request."""
+    bb = client()
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/auto-merge"
+    resp = bb.request("GET", path)
+    _print_json(resp)
+
+
+@auto_merge_app.command("set")
+def pr_auto_merge_set(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+):
+    """Request auto-merge for a pull request."""
+    bb = client()
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/auto-merge"
+    bb.request("POST", path)
+    typer.echo(f"Requested auto-merge for PR #{pr_id}")
+
+
+@auto_merge_app.command("cancel")
+def pr_auto_merge_cancel(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+):
+    """Cancel auto-merge for a pull request."""
+    bb = client()
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/auto-merge"
+    bb.request("DELETE", path)
+    typer.echo(f"Cancelled auto-merge for PR #{pr_id}")
+
+
+@pr_app.command("activities")
+def pr_activities(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+    from_id: Optional[str] = typer.Option(None, "--from-id", help="Start from activity/comment id"),
+    from_type: Optional[str] = typer.Option(None, "--from-type", help="COMMENT or ACTIVITY"),
+    limit: int = typer.Option(50, help="Page size"),
+    max_items: int = typer.Option(200, help="Max items to fetch across pages"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON response"),
+):
+    """Get pull request activity."""
+    bb = client()
+    params: Dict[str, Any] = {}
+    if from_id:
+        params["fromId"] = from_id
+    if from_type:
+        params["fromType"] = from_type
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/activities"
+    activities = bb.paged_get(path, params=params, limit=limit, max_items=max_items)
+    if json_out:
+        _print_json(activities)
+    else:
+        _print_json(activities)
+
+
+@pr_app.command("changes")
+def pr_changes(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+    change_scope: Optional[str] = typer.Option(None, "--change-scope", help="ALL, UNREVIEWED, or RANGE"),
+    since_id: Optional[str] = typer.Option(None, "--since-id", help="Since commit hash (for RANGE)"),
+    until_id: Optional[str] = typer.Option(None, "--until-id", help="Until commit hash (for RANGE)"),
+    with_comments: Optional[bool] = typer.Option(
+        None, "--with-comments/--no-with-comments", help="Include comment counts"
+    ),
+    limit: int = typer.Option(50, help="Page size"),
+    max_items: int = typer.Option(200, help="Max items to fetch across pages"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON response"),
+):
+    """Get pull request changes."""
+    bb = client()
+    params: Dict[str, Any] = {}
+    if change_scope:
+        params["changeScope"] = change_scope
+    if since_id:
+        params["sinceId"] = since_id
+    if until_id:
+        params["untilId"] = until_id
+    if with_comments is not None:
+        params["withComments"] = str(with_comments).lower()
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/changes"
+    changes = bb.paged_get(path, params=params, limit=limit, max_items=max_items)
+    if json_out:
+        _print_json(changes)
+    else:
+        _print_json(changes)
+
+
+@pr_app.command("commits")
+def pr_commits(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+    with_counts: Optional[bool] = typer.Option(
+        None, "--with-counts/--no-with-counts", help="Include author/total counts"
+    ),
+    avatar_size: Optional[int] = typer.Option(None, "--avatar-size", help="Avatar size in pixels"),
+    avatar_scheme: Optional[str] = typer.Option(None, "--avatar-scheme", help="Avatar scheme (http/https)"),
+    limit: int = typer.Option(50, help="Page size"),
+    max_items: int = typer.Option(200, help="Max items to fetch across pages"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON response"),
+):
+    """Get pull request commits."""
+    bb = client()
+    params: Dict[str, Any] = {}
+    if with_counts is not None:
+        params["withCounts"] = str(with_counts).lower()
+    if avatar_size is not None:
+        params["avatarSize"] = avatar_size
+    if avatar_scheme:
+        params["avatarScheme"] = avatar_scheme
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/commits"
+    commits = bb.paged_get(path, params=params, limit=limit, max_items=max_items)
+    if json_out:
+        _print_json(commits)
+    else:
+        _print_json(commits)
+
+
+@pr_app.command("diff")
+def pr_diff(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+    context_lines: Optional[int] = typer.Option(None, "--context-lines", help="Context lines"),
+    whitespace: Optional[str] = typer.Option(None, "--whitespace", help="Whitespace option (ignore-all)"),
+):
+    """Stream raw pull request diff."""
+    bb = client()
+    params: Dict[str, Any] = {}
+    if context_lines is not None:
+        params["contextLines"] = context_lines
+    if whitespace:
+        params["whitespace"] = whitespace
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}.diff"
+    resp = bb.request("GET", path, params=params)
+    _print_raw(resp)
+
+
+@pr_app.command("diff-file")
+def pr_diff_file(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+    file_path: str = typer.Argument(..., help="File path within repository"),
+    since_id: Optional[str] = typer.Option(None, "--since-id", help="Since commit hash"),
+    until_id: Optional[str] = typer.Option(None, "--until-id", help="Until commit hash"),
+    src_path: Optional[str] = typer.Option(None, "--src-path", help="Previous path (rename/copy)"),
+    diff_type: Optional[str] = typer.Option(None, "--diff-type", help="Diff type hint"),
+    context_lines: Optional[int] = typer.Option(None, "--context-lines", help="Context lines"),
+    whitespace: Optional[str] = typer.Option(None, "--whitespace", help="Whitespace option (ignore-all)"),
+    with_comments: Optional[bool] = typer.Option(
+        None, "--with-comments/--no-with-comments", help="Include comments in diff"
+    ),
+    avatar_size: Optional[int] = typer.Option(None, "--avatar-size", help="Avatar size in pixels"),
+    avatar_scheme: Optional[str] = typer.Option(None, "--avatar-scheme", help="Avatar scheme (http/https)"),
+):
+    """Stream a diff for a file within a pull request."""
+    bb = client()
+    params: Dict[str, Any] = {}
+    if since_id:
+        params["sinceId"] = since_id
+    if until_id:
+        params["untilId"] = until_id
+    if src_path:
+        params["srcPath"] = src_path
+    if diff_type:
+        params["diffType"] = diff_type
+    if context_lines is not None:
+        params["contextLines"] = context_lines
+    if whitespace:
+        params["whitespace"] = whitespace
+    if with_comments is not None:
+        params["withComments"] = str(with_comments).lower()
+    if avatar_size is not None:
+        params["avatarSize"] = avatar_size
+    if avatar_scheme:
+        params["avatarScheme"] = avatar_scheme
+    enc_path = _encode_path(file_path)
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/diff/{enc_path}"
+    resp = bb.request("GET", path, params=params)
+    _print_raw(resp)
+
+
+@pr_app.command("diff-stats")
+def pr_diff_stats(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+    file_path: str = typer.Argument(..., help="File path within repository"),
+    since_id: Optional[str] = typer.Option(None, "--since-id", help="Since commit hash"),
+    until_id: Optional[str] = typer.Option(None, "--until-id", help="Until commit hash"),
+    src_path: Optional[str] = typer.Option(None, "--src-path", help="Previous path (rename/copy)"),
+    whitespace: Optional[str] = typer.Option(None, "--whitespace", help="Whitespace option (ignore-all)"),
+):
+    """Get diff stats summary for a file within a pull request."""
+    bb = client()
+    params: Dict[str, Any] = {}
+    if since_id:
+        params["sinceId"] = since_id
+    if until_id:
+        params["untilId"] = until_id
+    if src_path:
+        params["srcPath"] = src_path
+    if whitespace:
+        params["whitespace"] = whitespace
+    enc_path = _encode_path(file_path)
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/diff-stats-summary/{enc_path}"
+    resp = bb.request("GET", path, params=params)
+    _print_json(resp)
+
+
+@pr_app.command("patch")
+def pr_patch(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+):
+    """Stream pull request as a patch."""
+    bb = client()
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}.patch"
+    resp = bb.request("GET", path)
+    _print_raw(resp)
+
+
+@pr_app.command("merge-base")
+def pr_merge_base(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+):
+    """Get the merge base for a pull request."""
+    bb = client()
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/merge-base"
+    resp = bb.request("GET", path)
+    _print_json(resp)
+
+
+@pr_app.command("commit-message")
+def pr_commit_message(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+):
+    """Get commit message suggestion for a pull request."""
+    bb = client()
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/commit-message-suggestion"
+    resp = bb.request("GET", path)
+    _print_json(resp)
+
+
+@pr_app.command("rebase-check")
+def pr_rebase_check(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+):
+    """Check whether a pull request can be rebased."""
+    bb = client()
+    path = f"git/latest/projects/{project}/repos/{repo}/pull-requests/{pr_id}/rebase"
+    resp = bb.request_rest("GET", path)
+    _print_json(resp)
+
+
+@pr_app.command("rebase")
+def pr_rebase(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+    version: Optional[int] = typer.Option(None, "--version", help="PR version (auto-fetched if omitted)"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON response"),
+):
+    """Rebase a pull request."""
+    bb = client()
+    if version is None:
+        version = _get_pr_version(bb, project, repo, pr_id)
+    body = {"version": version}
+    path = f"git/latest/projects/{project}/repos/{repo}/pull-requests/{pr_id}/rebase"
+    resp = bb.request_rest("POST", path, json_body=body)
+    if json_out:
+        _print_json(resp)
+    else:
+        typer.echo(f"Rebased PR #{pr_id}")
+
+
+@pr_app.command("delete")
+def pr_delete(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+    version: Optional[int] = typer.Option(None, "--version", help="PR version (auto-fetched if omitted)"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON response"),
+):
+    """Delete a pull request."""
+    bb = client()
+    if version is None:
+        version = _get_pr_version(bb, project, repo, pr_id)
+    body = {"version": version}
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}"
+    resp = bb.request("DELETE", path, json_body=body)
+    if json_out:
+        _print_json(resp)
+    else:
+        typer.echo(f"Deleted PR #{pr_id}")
+
+
+@pr_app.command("for-commit")
+def pr_for_commit(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    commit_id: str = typer.Argument(..., help="Commit ID"),
+    limit: int = typer.Option(50, help="Page size"),
+    max_items: int = typer.Option(200, help="Max items to fetch across pages"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON response"),
+):
+    """Get pull requests containing a commit."""
+    bb = client()
+    path = f"projects/{project}/repos/{repo}/commits/{commit_id}/pull-requests"
+    prs = bb.paged_get(path, params={}, limit=limit, max_items=max_items)
+    if json_out:
+        _print_json(prs)
+    else:
+        _print_json(prs)
 
 
 @app.command("doctor")
