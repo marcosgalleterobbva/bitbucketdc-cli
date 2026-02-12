@@ -35,7 +35,9 @@ import typer
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
 pr_app = typer.Typer(no_args_is_help=True, add_completion=False)
+participants_app = typer.Typer(no_args_is_help=True, add_completion=False)
 app.add_typer(pr_app, name="pr", help="Pull request operations")
+pr_app.add_typer(participants_app, name="participants", help="PR participants and reviewers")
 
 
 class BBError(RuntimeError):
@@ -194,6 +196,60 @@ def _print_prs(prs: Iterable[Dict[str, Any]]) -> None:
         typer.echo(fmt_row(r))
 
 
+def _print_participants(items: Iterable[Dict[str, Any]]) -> None:
+    rows = []
+    for p in items:
+        user = p.get("user") or {}
+        name = user.get("displayName") or user.get("name") or user.get("slug") or ""
+        role = p.get("role") or ""
+        status = p.get("status") or ""
+        approved = p.get("approved")
+        approved_str = "" if approved is None else str(bool(approved))
+        rows.append((name, role, approved_str, status))
+
+    if not rows:
+        typer.echo("No participants.")
+        return
+
+    headers = ("USER", "ROLE", "APPROVED", "STATUS")
+    widths = [len(h) for h in headers]
+    for r in rows:
+        for i, cell in enumerate(r):
+            widths[i] = max(widths[i], len(cell))
+
+    def fmt_row(r):
+        return "  ".join(cell.ljust(widths[i]) for i, cell in enumerate(r))
+
+    typer.echo(fmt_row(headers))
+    typer.echo("  ".join("-" * w for w in widths))
+    for r in rows:
+        typer.echo(fmt_row(r))
+
+
+ROLE_CHOICES = {"AUTHOR", "REVIEWER", "PARTICIPANT"}
+STATUS_CHOICES = {"UNAPPROVED", "NEEDS_WORK", "APPROVED"}
+
+
+def _norm_choice(value: str, allowed: set[str], name: str) -> str:
+    v = value.strip().upper()
+    if v not in allowed:
+        opts = ", ".join(sorted(allowed))
+        raise BBError(f"Invalid {name} '{value}'. Allowed: {opts}.")
+    return v
+
+
+def _get_pr_version(bb: BitbucketClient, project: str, repo: str, pr_id: int) -> int:
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}"
+    pr = bb.request("GET", path)
+    version = pr.get("version")
+    if version is None:
+        raise BBError("Could not determine PR version. Pass --version explicitly.")
+    try:
+        return int(version)
+    except (TypeError, ValueError):
+        raise BBError(f"Invalid PR version returned: {version}")
+
+
 @pr_app.command("list")
 def pr_list(
     project: str = typer.Option(..., "--project", "-p", help="Project key, e.g. GL_KAIF_APP-ID-2866825_DSG"),
@@ -306,6 +362,271 @@ def pr_comment(
     resp = bb.request("POST", path, json_body=body)
     comment_id = resp.get("id", "?")
     typer.echo(f"Added comment {comment_id} to PR #{pr_id}")
+
+
+@pr_app.command("approve")
+def pr_approve(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+):
+    """Approve a pull request."""
+    bb = client()
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/approve"
+    bb.request("POST", path)
+    typer.echo(f"Approved PR #{pr_id}")
+
+
+@pr_app.command("unapprove")
+def pr_unapprove(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+):
+    """Unapprove a pull request."""
+    bb = client()
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/approve"
+    bb.request("DELETE", path)
+    typer.echo(f"Unapproved PR #{pr_id}")
+
+
+@pr_app.command("decline")
+def pr_decline(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+    version: Optional[int] = typer.Option(None, "--version", help="PR version (auto-fetched if omitted)"),
+    comment: str = typer.Option("", "--comment", help="Optional decline comment"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON response"),
+):
+    """Decline a pull request."""
+    bb = client()
+    if version is None:
+        version = _get_pr_version(bb, project, repo, pr_id)
+    body: Dict[str, Any] = {"version": version}
+    if comment:
+        body["comment"] = comment
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/decline"
+    resp = bb.request("POST", path, params={"version": version}, json_body=body)
+    if json_out:
+        _print_json(resp)
+        return
+    typer.echo(f"Declined PR #{pr_id}")
+
+
+@pr_app.command("reopen")
+def pr_reopen(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+    version: Optional[int] = typer.Option(None, "--version", help="PR version (auto-fetched if omitted)"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON response"),
+):
+    """Re-open a pull request."""
+    bb = client()
+    if version is None:
+        version = _get_pr_version(bb, project, repo, pr_id)
+    body = {"version": version}
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/reopen"
+    resp = bb.request("POST", path, params={"version": version}, json_body=body)
+    if json_out:
+        _print_json(resp)
+        return
+    typer.echo(f"Re-opened PR #{pr_id}")
+
+
+@pr_app.command("merge-check")
+def pr_merge_check(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+):
+    """Test if a pull request can be merged."""
+    bb = client()
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/merge"
+    resp = bb.request("GET", path)
+    _print_json(resp)
+
+
+@pr_app.command("merge")
+def pr_merge(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+    version: Optional[int] = typer.Option(None, "--version", help="PR version (auto-fetched if omitted)"),
+    message: str = typer.Option("", "--message", help="Optional merge message"),
+    strategy: str = typer.Option("", "--strategy", help="Merge strategy ID (if required)"),
+    auto_merge: Optional[bool] = typer.Option(None, "--auto-merge/--no-auto-merge", help="Request auto-merge"),
+    auto_subject: str = typer.Option("", "--auto-subject", help="Optional auto-merge subject"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON response"),
+):
+    """Merge a pull request."""
+    bb = client()
+    if version is None:
+        version = _get_pr_version(bb, project, repo, pr_id)
+    body: Dict[str, Any] = {"version": version}
+    if message:
+        body["message"] = message
+    if strategy:
+        body["strategyId"] = strategy
+    if auto_merge is not None:
+        body["autoMerge"] = bool(auto_merge)
+    if auto_subject:
+        body["autoSubject"] = auto_subject
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/merge"
+    resp = bb.request("POST", path, params={"version": version}, json_body=body)
+    if json_out:
+        _print_json(resp)
+        return
+    typer.echo(f"Merged PR #{pr_id}")
+
+
+@pr_app.command("update")
+def pr_update(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+    version: Optional[int] = typer.Option(None, "--version", help="PR version (auto-fetched if omitted)"),
+    title: Optional[str] = typer.Option(None, "--title", help="New title"),
+    description: Optional[str] = typer.Option(None, "--description", help="New description (use empty string to clear)"),
+    reviewer: List[str] = typer.Option(
+        [],
+        "--reviewer",
+        help="Reviewer username (repeatable). If set, replaces reviewers list.",
+    ),
+    draft: Optional[bool] = typer.Option(None, "--draft/--no-draft", help="Set PR draft status"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON response"),
+):
+    """Update pull request metadata (title/description/reviewers/draft)."""
+    if title is None and description is None and not reviewer and draft is None:
+        raise BBError("Nothing to update. Provide --title, --description, --reviewer, or --draft/--no-draft.")
+    bb = client()
+    if version is None:
+        version = _get_pr_version(bb, project, repo, pr_id)
+    body: Dict[str, Any] = {"version": version}
+    if title is not None:
+        body["title"] = title
+    if description is not None:
+        body["description"] = description
+    if reviewer:
+        body["reviewers"] = [{"user": {"name": r}} for r in reviewer]
+    if draft is not None:
+        body["draft"] = bool(draft)
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}"
+    resp = bb.request("PUT", path, json_body=body)
+    if json_out:
+        _print_json(resp)
+        return
+    new_version = resp.get("version", "?")
+    typer.echo(f"Updated PR #{pr_id} (version {new_version})")
+
+
+@pr_app.command("watch")
+def pr_watch(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+):
+    """Watch a pull request."""
+    bb = client()
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/watch"
+    bb.request("POST", path)
+    typer.echo(f"Watching PR #{pr_id}")
+
+
+@pr_app.command("unwatch")
+def pr_unwatch(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+):
+    """Stop watching a pull request."""
+    bb = client()
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/watch"
+    bb.request("DELETE", path)
+    typer.echo(f"Stopped watching PR #{pr_id}")
+
+
+@participants_app.command("list")
+def pr_participants_list(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+    limit: int = typer.Option(50, help="Page size"),
+    max_items: int = typer.Option(200, help="Max items to fetch across pages"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON instead of a table"),
+):
+    """List participants/reviewers on a pull request."""
+    bb = client()
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/participants"
+    participants = bb.paged_get(path, params={}, limit=limit, max_items=max_items)
+    if json_out:
+        _print_json(participants)
+    else:
+        _print_participants(participants)
+
+
+@participants_app.command("add")
+def pr_participants_add(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+    user: str = typer.Option(..., "--user", "-u", help="Username or user slug"),
+    role: str = typer.Option("REVIEWER", "--role", help="AUTHOR, REVIEWER, or PARTICIPANT"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON response"),
+):
+    """Assign a participant role (use role REVIEWER to add a reviewer)."""
+    bb = client()
+    role = _norm_choice(role, ROLE_CHOICES, "role")
+    body = {"user": {"name": user}, "role": role}
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/participants"
+    resp = bb.request("POST", path, json_body=body)
+    if json_out:
+        _print_json(resp)
+        return
+    typer.echo(f"Added {user} as {role} on PR #{pr_id}")
+
+
+@participants_app.command("remove")
+def pr_participants_remove(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+    user: str = typer.Argument(..., help="User slug to remove"),
+):
+    """Remove a participant/reviewer from a pull request."""
+    bb = client()
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/participants/{user}"
+    bb.request("DELETE", path)
+    typer.echo(f"Removed {user} from PR #{pr_id}")
+
+
+@participants_app.command("status")
+def pr_participants_status(
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    pr_id: int = typer.Argument(..., help="Pull request numeric ID"),
+    user: str = typer.Argument(..., help="User slug to update"),
+    status: str = typer.Option(..., "--status", help="UNAPPROVED, NEEDS_WORK, or APPROVED"),
+    last_reviewed_commit: Optional[str] = typer.Option(
+        None, "--last-reviewed-commit", help="Optional commit hash last reviewed"
+    ),
+    version: Optional[int] = typer.Option(None, "--version", help="PR version (optional)"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON response"),
+):
+    """Change a participant's status on a pull request."""
+    bb = client()
+    status = _norm_choice(status, STATUS_CHOICES, "status")
+    body: Dict[str, Any] = {"status": status}
+    if last_reviewed_commit:
+        body["lastReviewedCommit"] = last_reviewed_commit
+    params = {"version": version} if version is not None else None
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/participants/{user}"
+    resp = bb.request("PUT", path, params=params, json_body=body)
+    if json_out:
+        _print_json(resp)
+        return
+    typer.echo(f"Updated {user} status to {status} on PR #{pr_id}")
 
 
 @app.command("doctor")

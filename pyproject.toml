@@ -4,13 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bbdc-cli"
-version = "0.1.0"
+version = "0.2.0"
 description = "Typer CLI for Bitbucket Data Center"
 requires-python = ">=3.9"
 dependencies = [
-  "typer[all]>=0.9",
+  "typer>=0.9",
   "requests>=2.31",
 ]
 
 [project.scripts]
 bbdc = "bbdc_cli.__main__:main"
+
+[tool.setuptools]
+packages = ["bbdc_cli"]
