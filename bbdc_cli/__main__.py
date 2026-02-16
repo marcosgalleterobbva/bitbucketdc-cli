@@ -27,9 +27,10 @@ from __future__ import annotations
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from urllib.parse import quote
 from typing import Any, Dict, Iterable, List, Optional
+from urllib.parse import quote
 
 import requests
 import typer
@@ -47,6 +48,19 @@ pr_app.add_typer(comments_app, name="comments", help="PR comments")
 pr_app.add_typer(blockers_app, name="blockers", help="PR blocker comments")
 pr_app.add_typer(review_app, name="review", help="PR review workflow")
 pr_app.add_typer(auto_merge_app, name="auto-merge", help="PR auto-merge")
+
+batch_pr_app = typer.Typer(no_args_is_help=True, add_completion=False)
+batch_pr_comments_app = typer.Typer(no_args_is_help=True, add_completion=False)
+batch_pr_participants_app = typer.Typer(no_args_is_help=True, add_completion=False)
+batch_pr_blockers_app = typer.Typer(no_args_is_help=True, add_completion=False)
+batch_pr_review_app = typer.Typer(no_args_is_help=True, add_completion=False)
+batch_pr_auto_merge_app = typer.Typer(no_args_is_help=True, add_completion=False)
+pr_app.add_typer(batch_pr_app, name="batch", help="Batch pull request operations")
+batch_pr_app.add_typer(batch_pr_comments_app, name="comments", help="Batch PR comment operations")
+batch_pr_app.add_typer(batch_pr_participants_app, name="participants", help="Batch PR participant operations")
+batch_pr_app.add_typer(batch_pr_blockers_app, name="blockers", help="Batch PR blocker comment operations")
+batch_pr_app.add_typer(batch_pr_review_app, name="review", help="Batch PR review operations")
+batch_pr_app.add_typer(batch_pr_auto_merge_app, name="auto-merge", help="Batch PR auto-merge operations")
 
 
 class BBError(RuntimeError):
@@ -340,6 +354,1036 @@ def _get_comment_version(
         raise BBError(f"Invalid comment version returned: {version}")
 
 
+def _load_json_value(source: str) -> Any:
+    if source.startswith("@"):
+        path = source[1:]
+        if not path:
+            raise BBError("Invalid --defaults value; '@' must be followed by a file path.")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except FileNotFoundError:
+            raise BBError(f"Defaults file not found: {path}")
+        except json.JSONDecodeError as e:
+            raise BBError(f"Invalid JSON in defaults file {path}: {e}")
+    try:
+        return json.loads(source)
+    except json.JSONDecodeError as e:
+        raise BBError(f"Invalid JSON in --defaults: {e}")
+
+
+def _load_batch_items(path: str) -> List[Dict[str, Any]]:
+    try:
+        if path == "-":
+            data = json.load(sys.stdin)
+        else:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+    except FileNotFoundError:
+        raise BBError(f"Batch file not found: {path}")
+    except json.JSONDecodeError as e:
+        raise BBError(f"Invalid JSON in batch file {path}: {e}")
+
+    if not isinstance(data, list):
+        raise BBError("Batch file must contain a JSON list.")
+    for i, item in enumerate(data, start=1):
+        if not isinstance(item, dict):
+            raise BBError(f"Batch item {i} must be an object.")
+    return data
+
+
+def _load_batch_defaults(
+    defaults: Optional[str],
+    project: Optional[str],
+    repo: Optional[str],
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    if defaults:
+        data = _load_json_value(defaults)
+        if not isinstance(data, dict):
+            raise BBError("--defaults must be a JSON object.")
+        out.update(data)
+    if project:
+        out["project"] = project
+    if repo:
+        out["repo"] = repo
+    return out
+
+
+def _merge_defaults(item: Dict[str, Any], defaults: Dict[str, Any]) -> Dict[str, Any]:
+    if not defaults:
+        return dict(item)
+    merged = dict(defaults)
+    merged.update(item)
+    return merged
+
+
+def _prepare_batch_items(
+    file: str,
+    defaults: Optional[str],
+    project: Optional[str],
+    repo: Optional[str],
+) -> List[Dict[str, Any]]:
+    items = _load_batch_items(file)
+    defaults_map = _load_batch_defaults(defaults, project, repo)
+    if not defaults_map:
+        return items
+    return [_merge_defaults(item, defaults_map) for item in items]
+
+
+def _require_field(item: Dict[str, Any], field: str) -> Any:
+    if field not in item or item[field] is None:
+        raise BBError(f"Missing required field '{field}' in batch item.")
+    return item[field]
+
+
+def _coerce_str(value: Any, name: str) -> str:
+    if isinstance(value, str):
+        v = value.strip()
+        if v:
+            return v
+    raise BBError(f"Invalid {name}; expected non-empty string.")
+
+
+def _coerce_text(value: Any, name: str) -> str:
+    if isinstance(value, str):
+        return value
+    raise BBError(f"Invalid {name}; expected string.")
+
+
+def _coerce_int(value: Any, name: str) -> int:
+    if isinstance(value, bool):
+        raise BBError(f"Invalid {name}; expected integer.")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        v = value.strip()
+        try:
+            return int(v)
+        except ValueError:
+            pass
+    raise BBError(f"Invalid {name}; expected integer.")
+
+
+def _coerce_bool(value: Any, name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in {"true", "false"}:
+            return v == "true"
+    raise BBError(f"Invalid {name}; expected boolean.")
+
+
+def _coerce_str_list(value: Any, name: str) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        v = value.strip()
+        if not v:
+            raise BBError(f"Invalid {name}; expected non-empty string or list of strings.")
+        if "," in v:
+            parts = [p.strip() for p in v.split(",") if p.strip()]
+            if not parts:
+                raise BBError(f"Invalid {name}; expected non-empty string or list of strings.")
+            return parts
+        return [v]
+    if isinstance(value, list) and all(isinstance(x, str) for x in value):
+        cleaned = [x.strip() for x in value if x.strip()]
+        if not cleaned:
+            raise BBError(f"Invalid {name}; expected non-empty list of strings.")
+        return cleaned
+    raise BBError(f"Invalid {name}; expected string or list of strings.")
+
+
+def _optional_int(item: Dict[str, Any], field: str) -> Optional[int]:
+    if field not in item or item[field] is None:
+        return None
+    return _coerce_int(item[field], field)
+
+
+def _optional_text(item: Dict[str, Any], field: str) -> Optional[str]:
+    if field not in item or item[field] is None:
+        return None
+    return _coerce_text(item[field], field)
+
+
+def _optional_bool(item: Dict[str, Any], field: str) -> Optional[bool]:
+    if field not in item or item[field] is None:
+        return None
+    return _coerce_bool(item[field], field)
+
+
+def _optional_str(item: Dict[str, Any], field: str) -> Optional[str]:
+    if field not in item or item[field] is None:
+        return None
+    return _coerce_str(item[field], field)
+
+
+def _item_project_repo(item: Dict[str, Any]) -> tuple[str, str]:
+    project = _coerce_str(_require_field(item, "project"), "project")
+    repo = _coerce_str(_require_field(item, "repo"), "repo")
+    return project, repo
+
+
+def _item_pr(item: Dict[str, Any]) -> tuple[str, str, int]:
+    project, repo = _item_project_repo(item)
+    pr_id = _coerce_int(_require_field(item, "pr_id"), "pr_id")
+    return project, repo, pr_id
+
+
+def _item_comment(item: Dict[str, Any]) -> tuple[str, str, int, int]:
+    project, repo, pr_id = _item_pr(item)
+    comment_id = _coerce_int(_require_field(item, "comment_id"), "comment_id")
+    return project, repo, pr_id, comment_id
+
+
+def _item_reviewers(item: Dict[str, Any]) -> List[str]:
+    if "reviewers" in item:
+        return _coerce_str_list(item["reviewers"], "reviewers")
+    if "reviewer" in item:
+        return _coerce_str_list(item["reviewer"], "reviewer")
+    return []
+
+
+def _run_batch(
+    items: List[Dict[str, Any]],
+    op,
+    *,
+    concurrency: int,
+    continue_on_error: bool,
+) -> Dict[str, Any]:
+    if concurrency < 1:
+        raise BBError("--concurrency must be >= 1.")
+
+    results: List[Dict[str, Any]] = []
+
+    def run_one(idx: int, item: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            payload = op(item)
+            if payload is None:
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {"data": payload}
+            return {"index": idx, "ok": True, "item": item, **payload}
+        except Exception as e:
+            return {"index": idx, "ok": False, "item": item, "error": str(e)}
+
+    if concurrency == 1:
+        for idx, item in enumerate(items, start=1):
+            res = run_one(idx, item)
+            results.append(res)
+            if not res["ok"] and not continue_on_error:
+                break
+    else:
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = {
+                executor.submit(run_one, idx, item): idx for idx, item in enumerate(items, start=1)
+            }
+            for future in as_completed(futures):
+                res = future.result()
+                results.append(res)
+                if not res["ok"] and not continue_on_error:
+                    for pending in futures:
+                        if not pending.done():
+                            pending.cancel()
+                    break
+
+    results.sort(key=lambda r: r["index"])
+    ok_count = sum(1 for r in results if r.get("ok"))
+    fail_count = sum(1 for r in results if not r.get("ok"))
+    summary = {
+        "total": len(items),
+        "processed": len(results),
+        "ok": ok_count,
+        "failed": fail_count,
+    }
+    return {"summary": summary, "results": results}
+
+
+def _print_batch(payload: Dict[str, Any], json_out: bool) -> None:
+    if json_out:
+        _print_json(payload)
+        return
+    results = payload.get("results", [])
+    for r in results:
+        index = r.get("index", "?")
+        if r.get("ok"):
+            msg = r.get("message") or "OK"
+            typer.echo(f"[{index}] OK: {msg}")
+        else:
+            err = r.get("error") or "Unknown error"
+            typer.echo(f"[{index}] ERROR: {err}")
+    summary = payload.get("summary", {})
+    total = summary.get("total", 0)
+    processed = summary.get("processed", len(results))
+    ok_count = summary.get("ok", 0)
+    fail_count = summary.get("failed", 0)
+    if processed != total:
+        typer.echo(f"Summary: {ok_count} ok, {fail_count} failed (processed {processed}/{total}).")
+    else:
+        typer.echo(f"Summary: {ok_count} ok, {fail_count} failed.")
+
+
+def _batch_execute(
+    *,
+    file: str,
+    project: Optional[str],
+    repo: Optional[str],
+    defaults: Optional[str],
+    concurrency: int,
+    continue_on_error: bool,
+    json_out: bool,
+    op,
+) -> None:
+    bb = client()
+    items = _prepare_batch_items(file, defaults, project, repo)
+    payload = _run_batch(
+        items,
+        lambda item: op(bb, item),
+        concurrency=concurrency,
+        continue_on_error=continue_on_error,
+    )
+    _print_batch(payload, json_out)
+
+
+def _op_pr_get(bb: BitbucketClient, project: str, repo: str, pr_id: int) -> Dict[str, Any]:
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}"
+    pr = bb.request("GET", path)
+    return {"message": f"Fetched PR #{pr_id}", "data": pr}
+
+
+def _op_pr_create(
+    bb: BitbucketClient,
+    project: str,
+    repo: str,
+    from_branch: str,
+    to_branch: str,
+    title: str,
+    description: str,
+    reviewers: List[str],
+    draft: Optional[bool],
+) -> Dict[str, Any]:
+    body: Dict[str, Any] = {
+        "title": title,
+        "description": description,
+        "fromRef": {
+            "id": f"refs/heads/{from_branch}",
+            "repository": {"slug": repo, "project": {"key": project}},
+        },
+        "toRef": {
+            "id": f"refs/heads/{to_branch}",
+            "repository": {"slug": repo, "project": {"key": project}},
+        },
+    }
+    if reviewers:
+        body["reviewers"] = [{"user": {"name": r}} for r in reviewers]
+    if draft is not None:
+        body["draft"] = bool(draft)
+    path = f"projects/{project}/repos/{repo}/pull-requests"
+    created = bb.request("POST", path, json_body=body)
+    pr_id = created.get("id", "?")
+    links = created.get("links", {}).get("self", [])
+    url = links[0].get("href") if isinstance(links, list) and links else None
+    message = f"Created PR #{pr_id}" + (f": {url}" if url else "")
+    return {"message": message, "data": created}
+
+
+def _op_pr_comment(bb: BitbucketClient, project: str, repo: str, pr_id: int, text: str) -> Dict[str, Any]:
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/comments"
+    body = {"text": text}
+    resp = bb.request("POST", path, json_body=body)
+    comment_id = resp.get("id", "?")
+    return {"message": f"Added comment {comment_id} to PR #{pr_id}", "data": resp}
+
+
+def _op_pr_approve(bb: BitbucketClient, project: str, repo: str, pr_id: int) -> Dict[str, Any]:
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/approve"
+    bb.request("POST", path)
+    return {"message": f"Approved PR #{pr_id}"}
+
+
+def _op_pr_unapprove(bb: BitbucketClient, project: str, repo: str, pr_id: int) -> Dict[str, Any]:
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/approve"
+    bb.request("DELETE", path)
+    return {"message": f"Unapproved PR #{pr_id}"}
+
+
+def _op_pr_decline(
+    bb: BitbucketClient,
+    project: str,
+    repo: str,
+    pr_id: int,
+    version: Optional[int],
+    comment: Optional[str],
+) -> Dict[str, Any]:
+    if version is None:
+        version = _get_pr_version(bb, project, repo, pr_id)
+    body: Dict[str, Any] = {"version": version}
+    if comment:
+        body["comment"] = comment
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/decline"
+    resp = bb.request("POST", path, params={"version": version}, json_body=body)
+    return {"message": f"Declined PR #{pr_id}", "data": resp}
+
+
+def _op_pr_reopen(
+    bb: BitbucketClient, project: str, repo: str, pr_id: int, version: Optional[int]
+) -> Dict[str, Any]:
+    if version is None:
+        version = _get_pr_version(bb, project, repo, pr_id)
+    body = {"version": version}
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/reopen"
+    resp = bb.request("POST", path, params={"version": version}, json_body=body)
+    return {"message": f"Re-opened PR #{pr_id}", "data": resp}
+
+
+def _op_pr_merge_check(bb: BitbucketClient, project: str, repo: str, pr_id: int) -> Dict[str, Any]:
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/merge"
+    resp = bb.request("GET", path)
+    return {"message": f"Merge check for PR #{pr_id}", "data": resp}
+
+
+def _op_pr_merge(
+    bb: BitbucketClient,
+    project: str,
+    repo: str,
+    pr_id: int,
+    version: Optional[int],
+    message: Optional[str],
+    strategy: Optional[str],
+    auto_merge: Optional[bool],
+    auto_subject: Optional[str],
+) -> Dict[str, Any]:
+    if version is None:
+        version = _get_pr_version(bb, project, repo, pr_id)
+    body: Dict[str, Any] = {"version": version}
+    if message:
+        body["message"] = message
+    if strategy:
+        body["strategyId"] = strategy
+    if auto_merge is not None:
+        body["autoMerge"] = bool(auto_merge)
+    if auto_subject:
+        body["autoSubject"] = auto_subject
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/merge"
+    resp = bb.request("POST", path, params={"version": version}, json_body=body)
+    return {"message": f"Merged PR #{pr_id}", "data": resp}
+
+
+def _op_pr_update(
+    bb: BitbucketClient,
+    project: str,
+    repo: str,
+    pr_id: int,
+    version: Optional[int],
+    title: Optional[str],
+    description: Optional[str],
+    reviewers: List[str],
+    draft: Optional[bool],
+) -> Dict[str, Any]:
+    if title is None and description is None and not reviewers and draft is None:
+        raise BBError("Nothing to update. Provide title, description, reviewers, or draft.")
+    if version is None:
+        version = _get_pr_version(bb, project, repo, pr_id)
+    body: Dict[str, Any] = {"version": version}
+    if title is not None:
+        body["title"] = title
+    if description is not None:
+        body["description"] = description
+    if reviewers:
+        body["reviewers"] = [{"user": {"name": r}} for r in reviewers]
+    if draft is not None:
+        body["draft"] = bool(draft)
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}"
+    resp = bb.request("PUT", path, json_body=body)
+    new_version = resp.get("version", "?")
+    return {"message": f"Updated PR #{pr_id} (version {new_version})", "data": resp}
+
+
+def _op_pr_watch(bb: BitbucketClient, project: str, repo: str, pr_id: int) -> Dict[str, Any]:
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/watch"
+    bb.request("POST", path)
+    return {"message": f"Watching PR #{pr_id}"}
+
+
+def _op_pr_unwatch(bb: BitbucketClient, project: str, repo: str, pr_id: int) -> Dict[str, Any]:
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/watch"
+    bb.request("DELETE", path)
+    return {"message": f"Stopped watching PR #{pr_id}"}
+
+
+def _op_pr_merge_base(bb: BitbucketClient, project: str, repo: str, pr_id: int) -> Dict[str, Any]:
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/merge-base"
+    resp = bb.request("GET", path)
+    return {"message": f"Merge base for PR #{pr_id}", "data": resp}
+
+
+def _op_pr_commit_message(bb: BitbucketClient, project: str, repo: str, pr_id: int) -> Dict[str, Any]:
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/commit-message-suggestion"
+    resp = bb.request("GET", path)
+    return {"message": f"Commit message suggestion for PR #{pr_id}", "data": resp}
+
+
+def _op_pr_rebase_check(bb: BitbucketClient, project: str, repo: str, pr_id: int) -> Dict[str, Any]:
+    path = f"git/latest/projects/{project}/repos/{repo}/pull-requests/{pr_id}/rebase"
+    resp = bb.request_rest("GET", path)
+    return {"message": f"Rebase check for PR #{pr_id}", "data": resp}
+
+
+def _op_pr_rebase(
+    bb: BitbucketClient, project: str, repo: str, pr_id: int, version: Optional[int]
+) -> Dict[str, Any]:
+    if version is None:
+        version = _get_pr_version(bb, project, repo, pr_id)
+    body = {"version": version}
+    path = f"git/latest/projects/{project}/repos/{repo}/pull-requests/{pr_id}/rebase"
+    resp = bb.request_rest("POST", path, json_body=body)
+    return {"message": f"Rebased PR #{pr_id}", "data": resp}
+
+
+def _op_pr_delete(
+    bb: BitbucketClient, project: str, repo: str, pr_id: int, version: Optional[int]
+) -> Dict[str, Any]:
+    if version is None:
+        version = _get_pr_version(bb, project, repo, pr_id)
+    body = {"version": version}
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}"
+    resp = bb.request("DELETE", path, json_body=body)
+    return {"message": f"Deleted PR #{pr_id}", "data": resp}
+
+
+def _op_pr_participants_add(
+    bb: BitbucketClient, project: str, repo: str, pr_id: int, user: str, role: str
+) -> Dict[str, Any]:
+    role = _norm_choice(role, ROLE_CHOICES, "role")
+    body = {"user": {"name": user}, "role": role}
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/participants"
+    resp = bb.request("POST", path, json_body=body)
+    return {"message": f"Added {user} as {role} on PR #{pr_id}", "data": resp}
+
+
+def _op_pr_participants_remove(
+    bb: BitbucketClient, project: str, repo: str, pr_id: int, user: str
+) -> Dict[str, Any]:
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/participants/{user}"
+    bb.request("DELETE", path)
+    return {"message": f"Removed {user} from PR #{pr_id}"}
+
+
+def _op_pr_participants_status(
+    bb: BitbucketClient,
+    project: str,
+    repo: str,
+    pr_id: int,
+    user: str,
+    status: str,
+    last_reviewed_commit: Optional[str],
+    version: Optional[int],
+) -> Dict[str, Any]:
+    status = _norm_choice(status, STATUS_CHOICES, "status")
+    body: Dict[str, Any] = {"status": status}
+    if last_reviewed_commit:
+        body["lastReviewedCommit"] = last_reviewed_commit
+    params = {"version": version} if version is not None else None
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/participants/{user}"
+    resp = bb.request("PUT", path, params=params, json_body=body)
+    return {"message": f"Updated {user} status to {status} on PR #{pr_id}", "data": resp}
+
+
+def _op_pr_comments_get(
+    bb: BitbucketClient, project: str, repo: str, pr_id: int, comment_id: int
+) -> Dict[str, Any]:
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/comments/{comment_id}"
+    resp = bb.request("GET", path)
+    return {"message": f"Fetched comment {comment_id} on PR #{pr_id}", "data": resp}
+
+
+def _op_pr_comments_update(
+    bb: BitbucketClient,
+    project: str,
+    repo: str,
+    pr_id: int,
+    comment_id: int,
+    text: Optional[str],
+    severity: Optional[str],
+    state: Optional[str],
+    version: Optional[int],
+) -> Dict[str, Any]:
+    if text is None and severity is None and state is None:
+        raise BBError("Nothing to update. Provide text, severity, or state.")
+    if version is None:
+        version = _get_comment_version(bb, project, repo, pr_id, comment_id)
+    body: Dict[str, Any] = {"version": version}
+    if text is not None:
+        body["text"] = text
+    if severity is not None:
+        body["severity"] = _norm_choice(severity, COMMENT_SEVERITY_CHOICES, "severity")
+    if state is not None:
+        body["state"] = _norm_choice(state, COMMENT_STATE_CHOICES, "state")
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/comments/{comment_id}"
+    resp = bb.request("PUT", path, json_body=body)
+    return {"message": f"Updated comment {comment_id} on PR #{pr_id}", "data": resp}
+
+
+def _op_pr_comments_delete(
+    bb: BitbucketClient,
+    project: str,
+    repo: str,
+    pr_id: int,
+    comment_id: int,
+    version: Optional[int],
+) -> Dict[str, Any]:
+    if version is None:
+        version = _get_comment_version(bb, project, repo, pr_id, comment_id)
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/comments/{comment_id}"
+    bb.request("DELETE", path, params={"version": version})
+    return {"message": f"Deleted comment {comment_id} on PR #{pr_id}"}
+
+
+def _op_pr_comments_apply_suggestion(
+    bb: BitbucketClient,
+    project: str,
+    repo: str,
+    pr_id: int,
+    comment_id: int,
+    suggestion_index: int,
+    comment_version: Optional[int],
+    pr_version: Optional[int],
+    commit_message: Optional[str],
+) -> Dict[str, Any]:
+    if comment_version is None:
+        comment_version = _get_comment_version(bb, project, repo, pr_id, comment_id)
+    if pr_version is None:
+        pr_version = _get_pr_version(bb, project, repo, pr_id)
+    body: Dict[str, Any] = {
+        "commentVersion": comment_version,
+        "pullRequestVersion": pr_version,
+        "suggestionIndex": suggestion_index,
+    }
+    if commit_message:
+        body["commitMessage"] = commit_message
+    path = (
+        f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/comments/{comment_id}/apply-suggestion"
+    )
+    resp = bb.request("POST", path, json_body=body)
+    return {"message": f"Applied suggestion from comment {comment_id} on PR #{pr_id}", "data": resp}
+
+
+def _op_pr_comments_react(
+    bb: BitbucketClient, project: str, repo: str, pr_id: int, comment_id: int, emoticon: str
+) -> Dict[str, Any]:
+    path = (
+        f"comment-likes/latest/projects/{project}/repos/{repo}/pull-requests/{pr_id}"
+        f"/comments/{comment_id}/reactions/{emoticon}"
+    )
+    bb.request_rest("PUT", path)
+    return {"message": f"Reacted to comment {comment_id} on PR #{pr_id}"}
+
+
+def _op_pr_comments_unreact(
+    bb: BitbucketClient, project: str, repo: str, pr_id: int, comment_id: int, emoticon: str
+) -> Dict[str, Any]:
+    path = (
+        f"comment-likes/latest/projects/{project}/repos/{repo}/pull-requests/{pr_id}"
+        f"/comments/{comment_id}/reactions/{emoticon}"
+    )
+    bb.request_rest("DELETE", path)
+    return {"message": f"Removed reaction from comment {comment_id} on PR #{pr_id}"}
+
+
+def _op_pr_blockers_add(
+    bb: BitbucketClient, project: str, repo: str, pr_id: int, text: str
+) -> Dict[str, Any]:
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/blocker-comments"
+    body = {"text": text}
+    resp = bb.request("POST", path, json_body=body)
+    comment_id = resp.get("id", "?")
+    return {"message": f"Added blocker comment {comment_id} to PR #{pr_id}", "data": resp}
+
+
+def _op_pr_blockers_get(
+    bb: BitbucketClient, project: str, repo: str, pr_id: int, comment_id: int
+) -> Dict[str, Any]:
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/blocker-comments/{comment_id}"
+    resp = bb.request("GET", path)
+    return {"message": f"Fetched blocker comment {comment_id} on PR #{pr_id}", "data": resp}
+
+
+def _op_pr_blockers_update(
+    bb: BitbucketClient,
+    project: str,
+    repo: str,
+    pr_id: int,
+    comment_id: int,
+    text: Optional[str],
+    severity: Optional[str],
+    state: Optional[str],
+    version: Optional[int],
+) -> Dict[str, Any]:
+    if text is None and severity is None and state is None:
+        raise BBError("Nothing to update. Provide text, severity, or state.")
+    if version is None:
+        version = _get_comment_version(bb, project, repo, pr_id, comment_id, blocker=True)
+    body: Dict[str, Any] = {"version": version}
+    if text is not None:
+        body["text"] = text
+    if severity is not None:
+        body["severity"] = _norm_choice(severity, COMMENT_SEVERITY_CHOICES, "severity")
+    if state is not None:
+        body["state"] = _norm_choice(state, COMMENT_STATE_CHOICES, "state")
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/blocker-comments/{comment_id}"
+    resp = bb.request("PUT", path, json_body=body)
+    return {"message": f"Updated blocker comment {comment_id} on PR #{pr_id}", "data": resp}
+
+
+def _op_pr_blockers_delete(
+    bb: BitbucketClient,
+    project: str,
+    repo: str,
+    pr_id: int,
+    comment_id: int,
+    version: Optional[int],
+) -> Dict[str, Any]:
+    if version is None:
+        version = _get_comment_version(bb, project, repo, pr_id, comment_id, blocker=True)
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/blocker-comments/{comment_id}"
+    bb.request("DELETE", path, params={"version": version})
+    return {"message": f"Deleted blocker comment {comment_id} on PR #{pr_id}"}
+
+
+def _op_pr_review_get(bb: BitbucketClient, project: str, repo: str, pr_id: int) -> Dict[str, Any]:
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/review"
+    resp = bb.request("GET", path)
+    return {"message": f"Fetched review for PR #{pr_id}", "data": resp}
+
+
+def _op_pr_review_complete(
+    bb: BitbucketClient,
+    project: str,
+    repo: str,
+    pr_id: int,
+    comment_text: Optional[str],
+    last_reviewed_commit: Optional[str],
+    status: Optional[str],
+) -> Dict[str, Any]:
+    if comment_text is None and last_reviewed_commit is None and status is None:
+        raise BBError("Nothing to update. Provide comment, last-reviewed-commit, or status.")
+    body: Dict[str, Any] = {}
+    if comment_text is not None:
+        body["commentText"] = comment_text
+    if last_reviewed_commit is not None:
+        body["lastReviewedCommit"] = last_reviewed_commit
+    if status is not None:
+        body["participantStatus"] = _norm_choice(status, STATUS_CHOICES, "status")
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/review"
+    resp = bb.request("PUT", path, json_body=body)
+    return {"message": f"Completed review for PR #{pr_id}", "data": resp}
+
+
+def _op_pr_review_discard(
+    bb: BitbucketClient, project: str, repo: str, pr_id: int
+) -> Dict[str, Any]:
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/review"
+    bb.request("DELETE", path)
+    return {"message": f"Discarded review for PR #{pr_id}"}
+
+
+def _op_pr_auto_merge_get(
+    bb: BitbucketClient, project: str, repo: str, pr_id: int
+) -> Dict[str, Any]:
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/auto-merge"
+    resp = bb.request("GET", path)
+    return {"message": f"Fetched auto-merge for PR #{pr_id}", "data": resp}
+
+
+def _op_pr_auto_merge_set(
+    bb: BitbucketClient, project: str, repo: str, pr_id: int
+) -> Dict[str, Any]:
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/auto-merge"
+    bb.request("POST", path)
+    return {"message": f"Requested auto-merge for PR #{pr_id}"}
+
+
+def _op_pr_auto_merge_cancel(
+    bb: BitbucketClient, project: str, repo: str, pr_id: int
+) -> Dict[str, Any]:
+    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/auto-merge"
+    bb.request("DELETE", path)
+    return {"message": f"Cancelled auto-merge for PR #{pr_id}"}
+
+
+def _batch_op_pr_get(bb: BitbucketClient, item: Dict[str, Any]) -> Dict[str, Any]:
+    project, repo, pr_id = _item_pr(item)
+    return _op_pr_get(bb, project, repo, pr_id)
+
+
+def _batch_op_pr_create(bb: BitbucketClient, item: Dict[str, Any]) -> Dict[str, Any]:
+    project, repo = _item_project_repo(item)
+    from_branch = _coerce_str(_require_field(item, "from_branch"), "from_branch")
+    to_branch = _coerce_str(_require_field(item, "to_branch"), "to_branch")
+    title = _coerce_str(_require_field(item, "title"), "title")
+    description = _optional_text(item, "description")
+    if description is None:
+        description = ""
+    reviewers = _item_reviewers(item)
+    draft = _optional_bool(item, "draft")
+    return _op_pr_create(
+        bb,
+        project,
+        repo,
+        from_branch,
+        to_branch,
+        title,
+        description,
+        reviewers,
+        draft,
+    )
+
+
+def _batch_op_pr_comment(bb: BitbucketClient, item: Dict[str, Any]) -> Dict[str, Any]:
+    project, repo, pr_id = _item_pr(item)
+    text = _coerce_str(_require_field(item, "text"), "text")
+    return _op_pr_comment(bb, project, repo, pr_id, text)
+
+
+def _batch_op_pr_approve(bb: BitbucketClient, item: Dict[str, Any]) -> Dict[str, Any]:
+    project, repo, pr_id = _item_pr(item)
+    return _op_pr_approve(bb, project, repo, pr_id)
+
+
+def _batch_op_pr_unapprove(bb: BitbucketClient, item: Dict[str, Any]) -> Dict[str, Any]:
+    project, repo, pr_id = _item_pr(item)
+    return _op_pr_unapprove(bb, project, repo, pr_id)
+
+
+def _batch_op_pr_decline(bb: BitbucketClient, item: Dict[str, Any]) -> Dict[str, Any]:
+    project, repo, pr_id = _item_pr(item)
+    version = _optional_int(item, "version")
+    comment = _optional_text(item, "comment")
+    return _op_pr_decline(bb, project, repo, pr_id, version, comment)
+
+
+def _batch_op_pr_reopen(bb: BitbucketClient, item: Dict[str, Any]) -> Dict[str, Any]:
+    project, repo, pr_id = _item_pr(item)
+    version = _optional_int(item, "version")
+    return _op_pr_reopen(bb, project, repo, pr_id, version)
+
+
+def _batch_op_pr_merge_check(bb: BitbucketClient, item: Dict[str, Any]) -> Dict[str, Any]:
+    project, repo, pr_id = _item_pr(item)
+    return _op_pr_merge_check(bb, project, repo, pr_id)
+
+
+def _batch_op_pr_merge(bb: BitbucketClient, item: Dict[str, Any]) -> Dict[str, Any]:
+    project, repo, pr_id = _item_pr(item)
+    version = _optional_int(item, "version")
+    message = _optional_text(item, "message")
+    strategy = _optional_text(item, "strategy")
+    auto_merge = _optional_bool(item, "auto_merge")
+    auto_subject = _optional_text(item, "auto_subject")
+    return _op_pr_merge(
+        bb,
+        project,
+        repo,
+        pr_id,
+        version,
+        message,
+        strategy,
+        auto_merge,
+        auto_subject,
+    )
+
+
+def _batch_op_pr_update(bb: BitbucketClient, item: Dict[str, Any]) -> Dict[str, Any]:
+    project, repo, pr_id = _item_pr(item)
+    version = _optional_int(item, "version")
+    title = _optional_text(item, "title")
+    description = _optional_text(item, "description")
+    reviewers = _item_reviewers(item)
+    draft = _optional_bool(item, "draft")
+    return _op_pr_update(bb, project, repo, pr_id, version, title, description, reviewers, draft)
+
+
+def _batch_op_pr_watch(bb: BitbucketClient, item: Dict[str, Any]) -> Dict[str, Any]:
+    project, repo, pr_id = _item_pr(item)
+    return _op_pr_watch(bb, project, repo, pr_id)
+
+
+def _batch_op_pr_unwatch(bb: BitbucketClient, item: Dict[str, Any]) -> Dict[str, Any]:
+    project, repo, pr_id = _item_pr(item)
+    return _op_pr_unwatch(bb, project, repo, pr_id)
+
+
+def _batch_op_pr_merge_base(bb: BitbucketClient, item: Dict[str, Any]) -> Dict[str, Any]:
+    project, repo, pr_id = _item_pr(item)
+    return _op_pr_merge_base(bb, project, repo, pr_id)
+
+
+def _batch_op_pr_commit_message(bb: BitbucketClient, item: Dict[str, Any]) -> Dict[str, Any]:
+    project, repo, pr_id = _item_pr(item)
+    return _op_pr_commit_message(bb, project, repo, pr_id)
+
+
+def _batch_op_pr_rebase_check(bb: BitbucketClient, item: Dict[str, Any]) -> Dict[str, Any]:
+    project, repo, pr_id = _item_pr(item)
+    return _op_pr_rebase_check(bb, project, repo, pr_id)
+
+
+def _batch_op_pr_rebase(bb: BitbucketClient, item: Dict[str, Any]) -> Dict[str, Any]:
+    project, repo, pr_id = _item_pr(item)
+    version = _optional_int(item, "version")
+    return _op_pr_rebase(bb, project, repo, pr_id, version)
+
+
+def _batch_op_pr_delete(bb: BitbucketClient, item: Dict[str, Any]) -> Dict[str, Any]:
+    project, repo, pr_id = _item_pr(item)
+    version = _optional_int(item, "version")
+    return _op_pr_delete(bb, project, repo, pr_id, version)
+
+
+def _batch_op_pr_participants_add(bb: BitbucketClient, item: Dict[str, Any]) -> Dict[str, Any]:
+    project, repo, pr_id = _item_pr(item)
+    user = _coerce_str(_require_field(item, "user"), "user")
+    role = _coerce_str(item.get("role", "REVIEWER"), "role")
+    return _op_pr_participants_add(bb, project, repo, pr_id, user, role)
+
+
+def _batch_op_pr_participants_remove(bb: BitbucketClient, item: Dict[str, Any]) -> Dict[str, Any]:
+    project, repo, pr_id = _item_pr(item)
+    user = _coerce_str(_require_field(item, "user"), "user")
+    return _op_pr_participants_remove(bb, project, repo, pr_id, user)
+
+
+def _batch_op_pr_participants_status(bb: BitbucketClient, item: Dict[str, Any]) -> Dict[str, Any]:
+    project, repo, pr_id = _item_pr(item)
+    user = _coerce_str(_require_field(item, "user"), "user")
+    status = _coerce_str(_require_field(item, "status"), "status")
+    last_reviewed_commit = _optional_text(item, "last_reviewed_commit")
+    version = _optional_int(item, "version")
+    return _op_pr_participants_status(
+        bb, project, repo, pr_id, user, status, last_reviewed_commit, version
+    )
+
+
+def _batch_op_pr_comments_add(bb: BitbucketClient, item: Dict[str, Any]) -> Dict[str, Any]:
+    return _batch_op_pr_comment(bb, item)
+
+
+def _batch_op_pr_comments_get(bb: BitbucketClient, item: Dict[str, Any]) -> Dict[str, Any]:
+    project, repo, pr_id, comment_id = _item_comment(item)
+    return _op_pr_comments_get(bb, project, repo, pr_id, comment_id)
+
+
+def _batch_op_pr_comments_update(bb: BitbucketClient, item: Dict[str, Any]) -> Dict[str, Any]:
+    project, repo, pr_id, comment_id = _item_comment(item)
+    text = _optional_text(item, "text")
+    severity = _optional_text(item, "severity")
+    state = _optional_text(item, "state")
+    version = _optional_int(item, "version")
+    return _op_pr_comments_update(bb, project, repo, pr_id, comment_id, text, severity, state, version)
+
+
+def _batch_op_pr_comments_delete(bb: BitbucketClient, item: Dict[str, Any]) -> Dict[str, Any]:
+    project, repo, pr_id, comment_id = _item_comment(item)
+    version = _optional_int(item, "version")
+    return _op_pr_comments_delete(bb, project, repo, pr_id, comment_id, version)
+
+
+def _batch_op_pr_comments_apply_suggestion(bb: BitbucketClient, item: Dict[str, Any]) -> Dict[str, Any]:
+    project, repo, pr_id, comment_id = _item_comment(item)
+    suggestion_index = _coerce_int(_require_field(item, "suggestion_index"), "suggestion_index")
+    comment_version = _optional_int(item, "comment_version")
+    pr_version = _optional_int(item, "pr_version")
+    commit_message = _optional_text(item, "commit_message")
+    return _op_pr_comments_apply_suggestion(
+        bb,
+        project,
+        repo,
+        pr_id,
+        comment_id,
+        suggestion_index,
+        comment_version,
+        pr_version,
+        commit_message,
+    )
+
+
+def _batch_op_pr_comments_react(bb: BitbucketClient, item: Dict[str, Any]) -> Dict[str, Any]:
+    project, repo, pr_id, comment_id = _item_comment(item)
+    emoticon = _coerce_str(_require_field(item, "emoticon"), "emoticon")
+    return _op_pr_comments_react(bb, project, repo, pr_id, comment_id, emoticon)
+
+
+def _batch_op_pr_comments_unreact(bb: BitbucketClient, item: Dict[str, Any]) -> Dict[str, Any]:
+    project, repo, pr_id, comment_id = _item_comment(item)
+    emoticon = _coerce_str(_require_field(item, "emoticon"), "emoticon")
+    return _op_pr_comments_unreact(bb, project, repo, pr_id, comment_id, emoticon)
+
+
+def _batch_op_pr_blockers_add(bb: BitbucketClient, item: Dict[str, Any]) -> Dict[str, Any]:
+    project, repo, pr_id = _item_pr(item)
+    text = _coerce_str(_require_field(item, "text"), "text")
+    return _op_pr_blockers_add(bb, project, repo, pr_id, text)
+
+
+def _batch_op_pr_blockers_get(bb: BitbucketClient, item: Dict[str, Any]) -> Dict[str, Any]:
+    project, repo, pr_id, comment_id = _item_comment(item)
+    return _op_pr_blockers_get(bb, project, repo, pr_id, comment_id)
+
+
+def _batch_op_pr_blockers_update(bb: BitbucketClient, item: Dict[str, Any]) -> Dict[str, Any]:
+    project, repo, pr_id, comment_id = _item_comment(item)
+    text = _optional_text(item, "text")
+    severity = _optional_text(item, "severity")
+    state = _optional_text(item, "state")
+    version = _optional_int(item, "version")
+    return _op_pr_blockers_update(
+        bb, project, repo, pr_id, comment_id, text, severity, state, version
+    )
+
+
+def _batch_op_pr_blockers_delete(bb: BitbucketClient, item: Dict[str, Any]) -> Dict[str, Any]:
+    project, repo, pr_id, comment_id = _item_comment(item)
+    version = _optional_int(item, "version")
+    return _op_pr_blockers_delete(bb, project, repo, pr_id, comment_id, version)
+
+
+def _batch_op_pr_review_get(bb: BitbucketClient, item: Dict[str, Any]) -> Dict[str, Any]:
+    project, repo, pr_id = _item_pr(item)
+    return _op_pr_review_get(bb, project, repo, pr_id)
+
+
+def _batch_op_pr_review_complete(bb: BitbucketClient, item: Dict[str, Any]) -> Dict[str, Any]:
+    project, repo, pr_id = _item_pr(item)
+    comment_text = _optional_text(item, "comment")
+    last_reviewed_commit = _optional_text(item, "last_reviewed_commit")
+    status = _optional_text(item, "status")
+    return _op_pr_review_complete(
+        bb, project, repo, pr_id, comment_text, last_reviewed_commit, status
+    )
+
+
+def _batch_op_pr_review_discard(bb: BitbucketClient, item: Dict[str, Any]) -> Dict[str, Any]:
+    project, repo, pr_id = _item_pr(item)
+    return _op_pr_review_discard(bb, project, repo, pr_id)
+
+
+def _batch_op_pr_auto_merge_get(bb: BitbucketClient, item: Dict[str, Any]) -> Dict[str, Any]:
+    project, repo, pr_id = _item_pr(item)
+    return _op_pr_auto_merge_get(bb, project, repo, pr_id)
+
+
+def _batch_op_pr_auto_merge_set(bb: BitbucketClient, item: Dict[str, Any]) -> Dict[str, Any]:
+    project, repo, pr_id = _item_pr(item)
+    return _op_pr_auto_merge_set(bb, project, repo, pr_id)
+
+
+def _batch_op_pr_auto_merge_cancel(bb: BitbucketClient, item: Dict[str, Any]) -> Dict[str, Any]:
+    project, repo, pr_id = _item_pr(item)
+    return _op_pr_auto_merge_cancel(bb, project, repo, pr_id)
+
+
 @pr_app.command("list")
 def pr_list(
     project: str = typer.Option(..., "--project", "-p", help="Project key, e.g. GL_KAIF_APP-ID-2866825_DSG"),
@@ -377,9 +1421,8 @@ def pr_get(
 ):
     """Get a single pull request as JSON."""
     bb = client()
-    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}"
-    pr = bb.request("GET", path)
-    _print_json(pr)
+    resp = _op_pr_get(bb, project, repo, pr_id)
+    _print_json(resp["data"])
 
 
 @pr_app.command("create")
@@ -404,38 +1447,21 @@ def pr_create(
     Corresponds to Postman: Pull Requests -> Create pull request (POST)
     """
     bb = client()
-
-    body: Dict[str, Any] = {
-        "title": title,
-        "description": description,
-        "fromRef": {
-            "id": f"refs/heads/{from_branch}",
-            "repository": {"slug": repo, "project": {"key": project}},
-        },
-        "toRef": {
-            "id": f"refs/heads/{to_branch}",
-            "repository": {"slug": repo, "project": {"key": project}},
-        },
-    }
-
-    if reviewer:
-        body["reviewers"] = [{"user": {"name": r}} for r in reviewer]
-
-    if draft is not None:
-        # Bitbucket DC supports draft PRs in newer versions; if unsupported, server will 400.
-        body["draft"] = bool(draft)
-
-    path = f"projects/{project}/repos/{repo}/pull-requests"
-    created = bb.request("POST", path, json_body=body)
-
+    created = _op_pr_create(
+        bb,
+        project,
+        repo,
+        from_branch,
+        to_branch,
+        title,
+        description,
+        reviewer,
+        draft,
+    )
     if json_out:
-        _print_json(created)
-        return
-
-    pr_id = created.get("id", "?")
-    links = created.get("links", {}).get("self", [])
-    url = links[0].get("href") if isinstance(links, list) and links else None
-    typer.echo(f"Created PR #{pr_id}" + (f": {url}" if url else ""))
+        _print_json(created["data"])
+    else:
+        typer.echo(created["message"])
 
 
 @pr_app.command("comment")
@@ -447,11 +1473,8 @@ def pr_comment(
 ):
     """Add a comment to a pull request."""
     bb = client()
-    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/comments"
-    body = {"text": text}
-    resp = bb.request("POST", path, json_body=body)
-    comment_id = resp.get("id", "?")
-    typer.echo(f"Added comment {comment_id} to PR #{pr_id}")
+    resp = _op_pr_comment(bb, project, repo, pr_id, text)
+    typer.echo(resp["message"])
 
 
 @pr_app.command("approve")
@@ -462,9 +1485,8 @@ def pr_approve(
 ):
     """Approve a pull request."""
     bb = client()
-    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/approve"
-    bb.request("POST", path)
-    typer.echo(f"Approved PR #{pr_id}")
+    resp = _op_pr_approve(bb, project, repo, pr_id)
+    typer.echo(resp["message"])
 
 
 @pr_app.command("unapprove")
@@ -475,9 +1497,8 @@ def pr_unapprove(
 ):
     """Unapprove a pull request."""
     bb = client()
-    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/approve"
-    bb.request("DELETE", path)
-    typer.echo(f"Unapproved PR #{pr_id}")
+    resp = _op_pr_unapprove(bb, project, repo, pr_id)
+    typer.echo(resp["message"])
 
 
 @pr_app.command("decline")
@@ -491,17 +1512,11 @@ def pr_decline(
 ):
     """Decline a pull request."""
     bb = client()
-    if version is None:
-        version = _get_pr_version(bb, project, repo, pr_id)
-    body: Dict[str, Any] = {"version": version}
-    if comment:
-        body["comment"] = comment
-    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/decline"
-    resp = bb.request("POST", path, params={"version": version}, json_body=body)
+    resp = _op_pr_decline(bb, project, repo, pr_id, version, comment or None)
     if json_out:
-        _print_json(resp)
-        return
-    typer.echo(f"Declined PR #{pr_id}")
+        _print_json(resp["data"])
+    else:
+        typer.echo(resp["message"])
 
 
 @pr_app.command("reopen")
@@ -514,15 +1529,11 @@ def pr_reopen(
 ):
     """Re-open a pull request."""
     bb = client()
-    if version is None:
-        version = _get_pr_version(bb, project, repo, pr_id)
-    body = {"version": version}
-    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/reopen"
-    resp = bb.request("POST", path, params={"version": version}, json_body=body)
+    resp = _op_pr_reopen(bb, project, repo, pr_id, version)
     if json_out:
-        _print_json(resp)
-        return
-    typer.echo(f"Re-opened PR #{pr_id}")
+        _print_json(resp["data"])
+    else:
+        typer.echo(resp["message"])
 
 
 @pr_app.command("merge-check")
@@ -533,9 +1544,8 @@ def pr_merge_check(
 ):
     """Test if a pull request can be merged."""
     bb = client()
-    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/merge"
-    resp = bb.request("GET", path)
-    _print_json(resp)
+    resp = _op_pr_merge_check(bb, project, repo, pr_id)
+    _print_json(resp["data"])
 
 
 @pr_app.command("merge")
@@ -552,23 +1562,21 @@ def pr_merge(
 ):
     """Merge a pull request."""
     bb = client()
-    if version is None:
-        version = _get_pr_version(bb, project, repo, pr_id)
-    body: Dict[str, Any] = {"version": version}
-    if message:
-        body["message"] = message
-    if strategy:
-        body["strategyId"] = strategy
-    if auto_merge is not None:
-        body["autoMerge"] = bool(auto_merge)
-    if auto_subject:
-        body["autoSubject"] = auto_subject
-    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/merge"
-    resp = bb.request("POST", path, params={"version": version}, json_body=body)
+    resp = _op_pr_merge(
+        bb,
+        project,
+        repo,
+        pr_id,
+        version,
+        message or None,
+        strategy or None,
+        auto_merge,
+        auto_subject or None,
+    )
     if json_out:
-        _print_json(resp)
-        return
-    typer.echo(f"Merged PR #{pr_id}")
+        _print_json(resp["data"])
+    else:
+        typer.echo(resp["message"])
 
 
 @pr_app.command("update")
@@ -588,27 +1596,12 @@ def pr_update(
     json_out: bool = typer.Option(False, "--json", help="Print raw JSON response"),
 ):
     """Update pull request metadata (title/description/reviewers/draft)."""
-    if title is None and description is None and not reviewer and draft is None:
-        raise BBError("Nothing to update. Provide --title, --description, --reviewer, or --draft/--no-draft.")
     bb = client()
-    if version is None:
-        version = _get_pr_version(bb, project, repo, pr_id)
-    body: Dict[str, Any] = {"version": version}
-    if title is not None:
-        body["title"] = title
-    if description is not None:
-        body["description"] = description
-    if reviewer:
-        body["reviewers"] = [{"user": {"name": r}} for r in reviewer]
-    if draft is not None:
-        body["draft"] = bool(draft)
-    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}"
-    resp = bb.request("PUT", path, json_body=body)
+    resp = _op_pr_update(bb, project, repo, pr_id, version, title, description, reviewer, draft)
     if json_out:
-        _print_json(resp)
-        return
-    new_version = resp.get("version", "?")
-    typer.echo(f"Updated PR #{pr_id} (version {new_version})")
+        _print_json(resp["data"])
+    else:
+        typer.echo(resp["message"])
 
 
 @pr_app.command("watch")
@@ -619,9 +1612,8 @@ def pr_watch(
 ):
     """Watch a pull request."""
     bb = client()
-    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/watch"
-    bb.request("POST", path)
-    typer.echo(f"Watching PR #{pr_id}")
+    resp = _op_pr_watch(bb, project, repo, pr_id)
+    typer.echo(resp["message"])
 
 
 @pr_app.command("unwatch")
@@ -632,9 +1624,8 @@ def pr_unwatch(
 ):
     """Stop watching a pull request."""
     bb = client()
-    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/watch"
-    bb.request("DELETE", path)
-    typer.echo(f"Stopped watching PR #{pr_id}")
+    resp = _op_pr_unwatch(bb, project, repo, pr_id)
+    typer.echo(resp["message"])
 
 
 @participants_app.command("list")
@@ -667,14 +1658,11 @@ def pr_participants_add(
 ):
     """Assign a participant role (use role REVIEWER to add a reviewer)."""
     bb = client()
-    role = _norm_choice(role, ROLE_CHOICES, "role")
-    body = {"user": {"name": user}, "role": role}
-    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/participants"
-    resp = bb.request("POST", path, json_body=body)
+    resp = _op_pr_participants_add(bb, project, repo, pr_id, user, role)
     if json_out:
-        _print_json(resp)
-        return
-    typer.echo(f"Added {user} as {role} on PR #{pr_id}")
+        _print_json(resp["data"])
+    else:
+        typer.echo(resp["message"])
 
 
 @participants_app.command("remove")
@@ -686,9 +1674,8 @@ def pr_participants_remove(
 ):
     """Remove a participant/reviewer from a pull request."""
     bb = client()
-    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/participants/{user}"
-    bb.request("DELETE", path)
-    typer.echo(f"Removed {user} from PR #{pr_id}")
+    resp = _op_pr_participants_remove(bb, project, repo, pr_id, user)
+    typer.echo(resp["message"])
 
 
 @participants_app.command("status")
@@ -706,17 +1693,13 @@ def pr_participants_status(
 ):
     """Change a participant's status on a pull request."""
     bb = client()
-    status = _norm_choice(status, STATUS_CHOICES, "status")
-    body: Dict[str, Any] = {"status": status}
-    if last_reviewed_commit:
-        body["lastReviewedCommit"] = last_reviewed_commit
-    params = {"version": version} if version is not None else None
-    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/participants/{user}"
-    resp = bb.request("PUT", path, params=params, json_body=body)
+    resp = _op_pr_participants_status(
+        bb, project, repo, pr_id, user, status, last_reviewed_commit, version
+    )
     if json_out:
-        _print_json(resp)
-        return
-    typer.echo(f"Updated {user} status to {status} on PR #{pr_id}")
+        _print_json(resp["data"])
+    else:
+        typer.echo(resp["message"])
 
 
 @participants_app.command("search")
@@ -803,9 +1786,8 @@ def pr_comments_get(
 ):
     """Get a pull request comment."""
     bb = client()
-    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/comments/{comment_id}"
-    resp = bb.request("GET", path)
-    _print_json(resp)
+    resp = _op_pr_comments_get(bb, project, repo, pr_id, comment_id)
+    _print_json(resp["data"])
 
 
 @comments_app.command("update")
@@ -821,24 +1803,14 @@ def pr_comments_update(
     json_out: bool = typer.Option(False, "--json", help="Print raw JSON response"),
 ):
     """Update a pull request comment."""
-    if text is None and severity is None and state is None:
-        raise BBError("Nothing to update. Provide --text, --severity, or --state.")
     bb = client()
-    if version is None:
-        version = _get_comment_version(bb, project, repo, pr_id, comment_id)
-    body: Dict[str, Any] = {"version": version}
-    if text is not None:
-        body["text"] = text
-    if severity is not None:
-        body["severity"] = _norm_choice(severity, COMMENT_SEVERITY_CHOICES, "severity")
-    if state is not None:
-        body["state"] = _norm_choice(state, COMMENT_STATE_CHOICES, "state")
-    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/comments/{comment_id}"
-    resp = bb.request("PUT", path, json_body=body)
+    resp = _op_pr_comments_update(
+        bb, project, repo, pr_id, comment_id, text, severity, state, version
+    )
     if json_out:
-        _print_json(resp)
+        _print_json(resp["data"])
     else:
-        typer.echo(f"Updated comment {comment_id} on PR #{pr_id}")
+        typer.echo(resp["message"])
 
 
 @comments_app.command("delete")
@@ -851,11 +1823,8 @@ def pr_comments_delete(
 ):
     """Delete a pull request comment."""
     bb = client()
-    if version is None:
-        version = _get_comment_version(bb, project, repo, pr_id, comment_id)
-    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/comments/{comment_id}"
-    bb.request("DELETE", path, params={"version": version})
-    typer.echo(f"Deleted comment {comment_id} on PR #{pr_id}")
+    resp = _op_pr_comments_delete(bb, project, repo, pr_id, comment_id, version)
+    typer.echo(resp["message"])
 
 
 @comments_app.command("apply-suggestion")
@@ -872,25 +1841,21 @@ def pr_comments_apply_suggestion(
 ):
     """Apply a suggestion from a pull request comment."""
     bb = client()
-    if comment_version is None:
-        comment_version = _get_comment_version(bb, project, repo, pr_id, comment_id)
-    if pr_version is None:
-        pr_version = _get_pr_version(bb, project, repo, pr_id)
-    body: Dict[str, Any] = {
-        "commentVersion": comment_version,
-        "pullRequestVersion": pr_version,
-        "suggestionIndex": suggestion_index,
-    }
-    if commit_message:
-        body["commitMessage"] = commit_message
-    path = (
-        f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/comments/{comment_id}/apply-suggestion"
+    resp = _op_pr_comments_apply_suggestion(
+        bb,
+        project,
+        repo,
+        pr_id,
+        comment_id,
+        suggestion_index,
+        comment_version,
+        pr_version,
+        commit_message or None,
     )
-    resp = bb.request("POST", path, json_body=body)
     if json_out:
-        _print_json(resp)
+        _print_json(resp["data"])
     else:
-        typer.echo(f"Applied suggestion from comment {comment_id} on PR #{pr_id}")
+        typer.echo(resp["message"])
 
 
 @comments_app.command("react")
@@ -903,12 +1868,8 @@ def pr_comments_react(
 ):
     """React to a pull request comment."""
     bb = client()
-    path = (
-        f"comment-likes/latest/projects/{project}/repos/{repo}/pull-requests/{pr_id}"
-        f"/comments/{comment_id}/reactions/{emoticon}"
-    )
-    bb.request_rest("PUT", path)
-    typer.echo(f"Reacted to comment {comment_id} on PR #{pr_id}")
+    resp = _op_pr_comments_react(bb, project, repo, pr_id, comment_id, emoticon)
+    typer.echo(resp["message"])
 
 
 @comments_app.command("unreact")
@@ -921,12 +1882,8 @@ def pr_comments_unreact(
 ):
     """Remove a reaction from a pull request comment."""
     bb = client()
-    path = (
-        f"comment-likes/latest/projects/{project}/repos/{repo}/pull-requests/{pr_id}"
-        f"/comments/{comment_id}/reactions/{emoticon}"
-    )
-    bb.request_rest("DELETE", path)
-    typer.echo(f"Removed reaction from comment {comment_id} on PR #{pr_id}")
+    resp = _op_pr_comments_unreact(bb, project, repo, pr_id, comment_id, emoticon)
+    typer.echo(resp["message"])
 
 
 @blockers_app.command("list")
@@ -973,14 +1930,11 @@ def pr_blockers_add(
 ):
     """Add a blocker comment to a pull request."""
     bb = client()
-    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/blocker-comments"
-    body = {"text": text}
-    resp = bb.request("POST", path, json_body=body)
+    resp = _op_pr_blockers_add(bb, project, repo, pr_id, text)
     if json_out:
-        _print_json(resp)
+        _print_json(resp["data"])
     else:
-        comment_id = resp.get("id", "?")
-        typer.echo(f"Added blocker comment {comment_id} to PR #{pr_id}")
+        typer.echo(resp["message"])
 
 
 @blockers_app.command("get")
@@ -992,9 +1946,8 @@ def pr_blockers_get(
 ):
     """Get a blocker comment."""
     bb = client()
-    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/blocker-comments/{comment_id}"
-    resp = bb.request("GET", path)
-    _print_json(resp)
+    resp = _op_pr_blockers_get(bb, project, repo, pr_id, comment_id)
+    _print_json(resp["data"])
 
 
 @blockers_app.command("update")
@@ -1010,24 +1963,14 @@ def pr_blockers_update(
     json_out: bool = typer.Option(False, "--json", help="Print raw JSON response"),
 ):
     """Update a blocker comment."""
-    if text is None and severity is None and state is None:
-        raise BBError("Nothing to update. Provide --text, --severity, or --state.")
     bb = client()
-    if version is None:
-        version = _get_comment_version(bb, project, repo, pr_id, comment_id, blocker=True)
-    body: Dict[str, Any] = {"version": version}
-    if text is not None:
-        body["text"] = text
-    if severity is not None:
-        body["severity"] = _norm_choice(severity, COMMENT_SEVERITY_CHOICES, "severity")
-    if state is not None:
-        body["state"] = _norm_choice(state, COMMENT_STATE_CHOICES, "state")
-    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/blocker-comments/{comment_id}"
-    resp = bb.request("PUT", path, json_body=body)
+    resp = _op_pr_blockers_update(
+        bb, project, repo, pr_id, comment_id, text, severity, state, version
+    )
     if json_out:
-        _print_json(resp)
+        _print_json(resp["data"])
     else:
-        typer.echo(f"Updated blocker comment {comment_id} on PR #{pr_id}")
+        typer.echo(resp["message"])
 
 
 @blockers_app.command("delete")
@@ -1040,11 +1983,8 @@ def pr_blockers_delete(
 ):
     """Delete a blocker comment."""
     bb = client()
-    if version is None:
-        version = _get_comment_version(bb, project, repo, pr_id, comment_id, blocker=True)
-    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/blocker-comments/{comment_id}"
-    bb.request("DELETE", path, params={"version": version})
-    typer.echo(f"Deleted blocker comment {comment_id} on PR #{pr_id}")
+    resp = _op_pr_blockers_delete(bb, project, repo, pr_id, comment_id, version)
+    typer.echo(resp["message"])
 
 
 @review_app.command("get")
@@ -1055,9 +1995,8 @@ def pr_review_get(
 ):
     """Get pull request review thread."""
     bb = client()
-    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/review"
-    resp = bb.request("GET", path)
-    _print_json(resp)
+    resp = _op_pr_review_get(bb, project, repo, pr_id)
+    _print_json(resp["data"])
 
 
 @review_app.command("complete")
@@ -1073,22 +2012,14 @@ def pr_review_complete(
     json_out: bool = typer.Option(False, "--json", help="Print raw JSON response"),
 ):
     """Complete a pull request review."""
-    if comment_text is None and last_reviewed_commit is None and status is None:
-        raise BBError("Nothing to update. Provide --comment, --last-reviewed-commit, or --status.")
     bb = client()
-    body: Dict[str, Any] = {}
-    if comment_text is not None:
-        body["commentText"] = comment_text
-    if last_reviewed_commit is not None:
-        body["lastReviewedCommit"] = last_reviewed_commit
-    if status is not None:
-        body["participantStatus"] = _norm_choice(status, STATUS_CHOICES, "status")
-    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/review"
-    resp = bb.request("PUT", path, json_body=body)
+    resp = _op_pr_review_complete(
+        bb, project, repo, pr_id, comment_text, last_reviewed_commit, status
+    )
     if json_out:
-        _print_json(resp)
+        _print_json(resp["data"])
     else:
-        typer.echo(f"Completed review for PR #{pr_id}")
+        typer.echo(resp["message"])
 
 
 @review_app.command("discard")
@@ -1099,9 +2030,8 @@ def pr_review_discard(
 ):
     """Discard pull request review."""
     bb = client()
-    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/review"
-    bb.request("DELETE", path)
-    typer.echo(f"Discarded review for PR #{pr_id}")
+    resp = _op_pr_review_discard(bb, project, repo, pr_id)
+    typer.echo(resp["message"])
 
 
 @auto_merge_app.command("get")
@@ -1112,9 +2042,8 @@ def pr_auto_merge_get(
 ):
     """Get auto-merge request for a pull request."""
     bb = client()
-    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/auto-merge"
-    resp = bb.request("GET", path)
-    _print_json(resp)
+    resp = _op_pr_auto_merge_get(bb, project, repo, pr_id)
+    _print_json(resp["data"])
 
 
 @auto_merge_app.command("set")
@@ -1125,9 +2054,8 @@ def pr_auto_merge_set(
 ):
     """Request auto-merge for a pull request."""
     bb = client()
-    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/auto-merge"
-    bb.request("POST", path)
-    typer.echo(f"Requested auto-merge for PR #{pr_id}")
+    resp = _op_pr_auto_merge_set(bb, project, repo, pr_id)
+    typer.echo(resp["message"])
 
 
 @auto_merge_app.command("cancel")
@@ -1138,9 +2066,8 @@ def pr_auto_merge_cancel(
 ):
     """Cancel auto-merge for a pull request."""
     bb = client()
-    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/auto-merge"
-    bb.request("DELETE", path)
-    typer.echo(f"Cancelled auto-merge for PR #{pr_id}")
+    resp = _op_pr_auto_merge_cancel(bb, project, repo, pr_id)
+    typer.echo(resp["message"])
 
 
 @pr_app.command("activities")
@@ -1348,9 +2275,8 @@ def pr_merge_base(
 ):
     """Get the merge base for a pull request."""
     bb = client()
-    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/merge-base"
-    resp = bb.request("GET", path)
-    _print_json(resp)
+    resp = _op_pr_merge_base(bb, project, repo, pr_id)
+    _print_json(resp["data"])
 
 
 @pr_app.command("commit-message")
@@ -1361,9 +2287,8 @@ def pr_commit_message(
 ):
     """Get commit message suggestion for a pull request."""
     bb = client()
-    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}/commit-message-suggestion"
-    resp = bb.request("GET", path)
-    _print_json(resp)
+    resp = _op_pr_commit_message(bb, project, repo, pr_id)
+    _print_json(resp["data"])
 
 
 @pr_app.command("rebase-check")
@@ -1374,9 +2299,8 @@ def pr_rebase_check(
 ):
     """Check whether a pull request can be rebased."""
     bb = client()
-    path = f"git/latest/projects/{project}/repos/{repo}/pull-requests/{pr_id}/rebase"
-    resp = bb.request_rest("GET", path)
-    _print_json(resp)
+    resp = _op_pr_rebase_check(bb, project, repo, pr_id)
+    _print_json(resp["data"])
 
 
 @pr_app.command("rebase")
@@ -1389,15 +2313,11 @@ def pr_rebase(
 ):
     """Rebase a pull request."""
     bb = client()
-    if version is None:
-        version = _get_pr_version(bb, project, repo, pr_id)
-    body = {"version": version}
-    path = f"git/latest/projects/{project}/repos/{repo}/pull-requests/{pr_id}/rebase"
-    resp = bb.request_rest("POST", path, json_body=body)
+    resp = _op_pr_rebase(bb, project, repo, pr_id, version)
     if json_out:
-        _print_json(resp)
+        _print_json(resp["data"])
     else:
-        typer.echo(f"Rebased PR #{pr_id}")
+        typer.echo(resp["message"])
 
 
 @pr_app.command("delete")
@@ -1410,15 +2330,11 @@ def pr_delete(
 ):
     """Delete a pull request."""
     bb = client()
-    if version is None:
-        version = _get_pr_version(bb, project, repo, pr_id)
-    body = {"version": version}
-    path = f"projects/{project}/repos/{repo}/pull-requests/{pr_id}"
-    resp = bb.request("DELETE", path, json_body=body)
+    resp = _op_pr_delete(bb, project, repo, pr_id, version)
     if json_out:
-        _print_json(resp)
+        _print_json(resp["data"])
     else:
-        typer.echo(f"Deleted PR #{pr_id}")
+        typer.echo(resp["message"])
 
 
 @pr_app.command("for-commit")
@@ -1438,6 +2354,857 @@ def pr_for_commit(
         _print_json(prs)
     else:
         _print_json(prs)
+
+
+@batch_pr_app.command("get")
+def pr_batch_get(
+    file: str = typer.Option(..., "--file", "-f", help="Path to JSON list (or '-' for stdin)"),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Default project key"),
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Default repo slug"),
+    defaults: Optional[str] = typer.Option(None, "--defaults", help="JSON object or @file with default fields"),
+    concurrency: int = typer.Option(1, "--concurrency", "-c", help="Number of concurrent requests"),
+    continue_on_error: bool = typer.Option(True, "--continue-on-error/--stop-on-error"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON results"),
+):
+    """Batch get pull requests."""
+    _batch_execute(
+        file=file,
+        project=project,
+        repo=repo,
+        defaults=defaults,
+        concurrency=concurrency,
+        continue_on_error=continue_on_error,
+        json_out=json_out,
+        op=_batch_op_pr_get,
+    )
+
+
+@batch_pr_app.command("create")
+def pr_batch_create(
+    file: str = typer.Option(..., "--file", "-f", help="Path to JSON list (or '-' for stdin)"),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Default project key"),
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Default repo slug"),
+    defaults: Optional[str] = typer.Option(None, "--defaults", help="JSON object or @file with default fields"),
+    concurrency: int = typer.Option(1, "--concurrency", "-c", help="Number of concurrent requests"),
+    continue_on_error: bool = typer.Option(True, "--continue-on-error/--stop-on-error"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON results"),
+):
+    """Batch create pull requests."""
+    _batch_execute(
+        file=file,
+        project=project,
+        repo=repo,
+        defaults=defaults,
+        concurrency=concurrency,
+        continue_on_error=continue_on_error,
+        json_out=json_out,
+        op=_batch_op_pr_create,
+    )
+
+
+@batch_pr_app.command("comment")
+def pr_batch_comment(
+    file: str = typer.Option(..., "--file", "-f", help="Path to JSON list (or '-' for stdin)"),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Default project key"),
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Default repo slug"),
+    defaults: Optional[str] = typer.Option(None, "--defaults", help="JSON object or @file with default fields"),
+    concurrency: int = typer.Option(1, "--concurrency", "-c", help="Number of concurrent requests"),
+    continue_on_error: bool = typer.Option(True, "--continue-on-error/--stop-on-error"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON results"),
+):
+    """Batch add comments to pull requests."""
+    _batch_execute(
+        file=file,
+        project=project,
+        repo=repo,
+        defaults=defaults,
+        concurrency=concurrency,
+        continue_on_error=continue_on_error,
+        json_out=json_out,
+        op=_batch_op_pr_comment,
+    )
+
+
+@batch_pr_app.command("approve")
+def pr_batch_approve(
+    file: str = typer.Option(..., "--file", "-f", help="Path to JSON list (or '-' for stdin)"),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Default project key"),
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Default repo slug"),
+    defaults: Optional[str] = typer.Option(None, "--defaults", help="JSON object or @file with default fields"),
+    concurrency: int = typer.Option(1, "--concurrency", "-c", help="Number of concurrent requests"),
+    continue_on_error: bool = typer.Option(True, "--continue-on-error/--stop-on-error"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON results"),
+):
+    """Batch approve pull requests."""
+    _batch_execute(
+        file=file,
+        project=project,
+        repo=repo,
+        defaults=defaults,
+        concurrency=concurrency,
+        continue_on_error=continue_on_error,
+        json_out=json_out,
+        op=_batch_op_pr_approve,
+    )
+
+
+@batch_pr_app.command("unapprove")
+def pr_batch_unapprove(
+    file: str = typer.Option(..., "--file", "-f", help="Path to JSON list (or '-' for stdin)"),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Default project key"),
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Default repo slug"),
+    defaults: Optional[str] = typer.Option(None, "--defaults", help="JSON object or @file with default fields"),
+    concurrency: int = typer.Option(1, "--concurrency", "-c", help="Number of concurrent requests"),
+    continue_on_error: bool = typer.Option(True, "--continue-on-error/--stop-on-error"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON results"),
+):
+    """Batch unapprove pull requests."""
+    _batch_execute(
+        file=file,
+        project=project,
+        repo=repo,
+        defaults=defaults,
+        concurrency=concurrency,
+        continue_on_error=continue_on_error,
+        json_out=json_out,
+        op=_batch_op_pr_unapprove,
+    )
+
+
+@batch_pr_app.command("decline")
+def pr_batch_decline(
+    file: str = typer.Option(..., "--file", "-f", help="Path to JSON list (or '-' for stdin)"),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Default project key"),
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Default repo slug"),
+    defaults: Optional[str] = typer.Option(None, "--defaults", help="JSON object or @file with default fields"),
+    concurrency: int = typer.Option(1, "--concurrency", "-c", help="Number of concurrent requests"),
+    continue_on_error: bool = typer.Option(True, "--continue-on-error/--stop-on-error"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON results"),
+):
+    """Batch decline pull requests."""
+    _batch_execute(
+        file=file,
+        project=project,
+        repo=repo,
+        defaults=defaults,
+        concurrency=concurrency,
+        continue_on_error=continue_on_error,
+        json_out=json_out,
+        op=_batch_op_pr_decline,
+    )
+
+
+@batch_pr_app.command("reopen")
+def pr_batch_reopen(
+    file: str = typer.Option(..., "--file", "-f", help="Path to JSON list (or '-' for stdin)"),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Default project key"),
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Default repo slug"),
+    defaults: Optional[str] = typer.Option(None, "--defaults", help="JSON object or @file with default fields"),
+    concurrency: int = typer.Option(1, "--concurrency", "-c", help="Number of concurrent requests"),
+    continue_on_error: bool = typer.Option(True, "--continue-on-error/--stop-on-error"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON results"),
+):
+    """Batch reopen pull requests."""
+    _batch_execute(
+        file=file,
+        project=project,
+        repo=repo,
+        defaults=defaults,
+        concurrency=concurrency,
+        continue_on_error=continue_on_error,
+        json_out=json_out,
+        op=_batch_op_pr_reopen,
+    )
+
+
+@batch_pr_app.command("merge-check")
+def pr_batch_merge_check(
+    file: str = typer.Option(..., "--file", "-f", help="Path to JSON list (or '-' for stdin)"),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Default project key"),
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Default repo slug"),
+    defaults: Optional[str] = typer.Option(None, "--defaults", help="JSON object or @file with default fields"),
+    concurrency: int = typer.Option(1, "--concurrency", "-c", help="Number of concurrent requests"),
+    continue_on_error: bool = typer.Option(True, "--continue-on-error/--stop-on-error"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON results"),
+):
+    """Batch merge-check pull requests."""
+    _batch_execute(
+        file=file,
+        project=project,
+        repo=repo,
+        defaults=defaults,
+        concurrency=concurrency,
+        continue_on_error=continue_on_error,
+        json_out=json_out,
+        op=_batch_op_pr_merge_check,
+    )
+
+
+@batch_pr_app.command("merge")
+def pr_batch_merge(
+    file: str = typer.Option(..., "--file", "-f", help="Path to JSON list (or '-' for stdin)"),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Default project key"),
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Default repo slug"),
+    defaults: Optional[str] = typer.Option(None, "--defaults", help="JSON object or @file with default fields"),
+    concurrency: int = typer.Option(1, "--concurrency", "-c", help="Number of concurrent requests"),
+    continue_on_error: bool = typer.Option(True, "--continue-on-error/--stop-on-error"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON results"),
+):
+    """Batch merge pull requests."""
+    _batch_execute(
+        file=file,
+        project=project,
+        repo=repo,
+        defaults=defaults,
+        concurrency=concurrency,
+        continue_on_error=continue_on_error,
+        json_out=json_out,
+        op=_batch_op_pr_merge,
+    )
+
+
+@batch_pr_app.command("update")
+def pr_batch_update(
+    file: str = typer.Option(..., "--file", "-f", help="Path to JSON list (or '-' for stdin)"),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Default project key"),
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Default repo slug"),
+    defaults: Optional[str] = typer.Option(None, "--defaults", help="JSON object or @file with default fields"),
+    concurrency: int = typer.Option(1, "--concurrency", "-c", help="Number of concurrent requests"),
+    continue_on_error: bool = typer.Option(True, "--continue-on-error/--stop-on-error"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON results"),
+):
+    """Batch update pull requests."""
+    _batch_execute(
+        file=file,
+        project=project,
+        repo=repo,
+        defaults=defaults,
+        concurrency=concurrency,
+        continue_on_error=continue_on_error,
+        json_out=json_out,
+        op=_batch_op_pr_update,
+    )
+
+
+@batch_pr_app.command("watch")
+def pr_batch_watch(
+    file: str = typer.Option(..., "--file", "-f", help="Path to JSON list (or '-' for stdin)"),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Default project key"),
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Default repo slug"),
+    defaults: Optional[str] = typer.Option(None, "--defaults", help="JSON object or @file with default fields"),
+    concurrency: int = typer.Option(1, "--concurrency", "-c", help="Number of concurrent requests"),
+    continue_on_error: bool = typer.Option(True, "--continue-on-error/--stop-on-error"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON results"),
+):
+    """Batch watch pull requests."""
+    _batch_execute(
+        file=file,
+        project=project,
+        repo=repo,
+        defaults=defaults,
+        concurrency=concurrency,
+        continue_on_error=continue_on_error,
+        json_out=json_out,
+        op=_batch_op_pr_watch,
+    )
+
+
+@batch_pr_app.command("unwatch")
+def pr_batch_unwatch(
+    file: str = typer.Option(..., "--file", "-f", help="Path to JSON list (or '-' for stdin)"),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Default project key"),
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Default repo slug"),
+    defaults: Optional[str] = typer.Option(None, "--defaults", help="JSON object or @file with default fields"),
+    concurrency: int = typer.Option(1, "--concurrency", "-c", help="Number of concurrent requests"),
+    continue_on_error: bool = typer.Option(True, "--continue-on-error/--stop-on-error"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON results"),
+):
+    """Batch unwatch pull requests."""
+    _batch_execute(
+        file=file,
+        project=project,
+        repo=repo,
+        defaults=defaults,
+        concurrency=concurrency,
+        continue_on_error=continue_on_error,
+        json_out=json_out,
+        op=_batch_op_pr_unwatch,
+    )
+
+
+@batch_pr_app.command("merge-base")
+def pr_batch_merge_base(
+    file: str = typer.Option(..., "--file", "-f", help="Path to JSON list (or '-' for stdin)"),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Default project key"),
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Default repo slug"),
+    defaults: Optional[str] = typer.Option(None, "--defaults", help="JSON object or @file with default fields"),
+    concurrency: int = typer.Option(1, "--concurrency", "-c", help="Number of concurrent requests"),
+    continue_on_error: bool = typer.Option(True, "--continue-on-error/--stop-on-error"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON results"),
+):
+    """Batch get merge bases for pull requests."""
+    _batch_execute(
+        file=file,
+        project=project,
+        repo=repo,
+        defaults=defaults,
+        concurrency=concurrency,
+        continue_on_error=continue_on_error,
+        json_out=json_out,
+        op=_batch_op_pr_merge_base,
+    )
+
+
+@batch_pr_app.command("commit-message")
+def pr_batch_commit_message(
+    file: str = typer.Option(..., "--file", "-f", help="Path to JSON list (or '-' for stdin)"),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Default project key"),
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Default repo slug"),
+    defaults: Optional[str] = typer.Option(None, "--defaults", help="JSON object or @file with default fields"),
+    concurrency: int = typer.Option(1, "--concurrency", "-c", help="Number of concurrent requests"),
+    continue_on_error: bool = typer.Option(True, "--continue-on-error/--stop-on-error"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON results"),
+):
+    """Batch get commit message suggestions for pull requests."""
+    _batch_execute(
+        file=file,
+        project=project,
+        repo=repo,
+        defaults=defaults,
+        concurrency=concurrency,
+        continue_on_error=continue_on_error,
+        json_out=json_out,
+        op=_batch_op_pr_commit_message,
+    )
+
+
+@batch_pr_app.command("rebase-check")
+def pr_batch_rebase_check(
+    file: str = typer.Option(..., "--file", "-f", help="Path to JSON list (or '-' for stdin)"),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Default project key"),
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Default repo slug"),
+    defaults: Optional[str] = typer.Option(None, "--defaults", help="JSON object or @file with default fields"),
+    concurrency: int = typer.Option(1, "--concurrency", "-c", help="Number of concurrent requests"),
+    continue_on_error: bool = typer.Option(True, "--continue-on-error/--stop-on-error"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON results"),
+):
+    """Batch rebase-check pull requests."""
+    _batch_execute(
+        file=file,
+        project=project,
+        repo=repo,
+        defaults=defaults,
+        concurrency=concurrency,
+        continue_on_error=continue_on_error,
+        json_out=json_out,
+        op=_batch_op_pr_rebase_check,
+    )
+
+
+@batch_pr_app.command("rebase")
+def pr_batch_rebase(
+    file: str = typer.Option(..., "--file", "-f", help="Path to JSON list (or '-' for stdin)"),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Default project key"),
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Default repo slug"),
+    defaults: Optional[str] = typer.Option(None, "--defaults", help="JSON object or @file with default fields"),
+    concurrency: int = typer.Option(1, "--concurrency", "-c", help="Number of concurrent requests"),
+    continue_on_error: bool = typer.Option(True, "--continue-on-error/--stop-on-error"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON results"),
+):
+    """Batch rebase pull requests."""
+    _batch_execute(
+        file=file,
+        project=project,
+        repo=repo,
+        defaults=defaults,
+        concurrency=concurrency,
+        continue_on_error=continue_on_error,
+        json_out=json_out,
+        op=_batch_op_pr_rebase,
+    )
+
+
+@batch_pr_app.command("delete")
+def pr_batch_delete(
+    file: str = typer.Option(..., "--file", "-f", help="Path to JSON list (or '-' for stdin)"),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Default project key"),
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Default repo slug"),
+    defaults: Optional[str] = typer.Option(None, "--defaults", help="JSON object or @file with default fields"),
+    concurrency: int = typer.Option(1, "--concurrency", "-c", help="Number of concurrent requests"),
+    continue_on_error: bool = typer.Option(True, "--continue-on-error/--stop-on-error"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON results"),
+):
+    """Batch delete pull requests."""
+    _batch_execute(
+        file=file,
+        project=project,
+        repo=repo,
+        defaults=defaults,
+        concurrency=concurrency,
+        continue_on_error=continue_on_error,
+        json_out=json_out,
+        op=_batch_op_pr_delete,
+    )
+
+
+@batch_pr_participants_app.command("add")
+def pr_batch_participants_add(
+    file: str = typer.Option(..., "--file", "-f", help="Path to JSON list (or '-' for stdin)"),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Default project key"),
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Default repo slug"),
+    defaults: Optional[str] = typer.Option(None, "--defaults", help="JSON object or @file with default fields"),
+    concurrency: int = typer.Option(1, "--concurrency", "-c", help="Number of concurrent requests"),
+    continue_on_error: bool = typer.Option(True, "--continue-on-error/--stop-on-error"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON results"),
+):
+    """Batch add participants to pull requests."""
+    _batch_execute(
+        file=file,
+        project=project,
+        repo=repo,
+        defaults=defaults,
+        concurrency=concurrency,
+        continue_on_error=continue_on_error,
+        json_out=json_out,
+        op=_batch_op_pr_participants_add,
+    )
+
+
+@batch_pr_participants_app.command("remove")
+def pr_batch_participants_remove(
+    file: str = typer.Option(..., "--file", "-f", help="Path to JSON list (or '-' for stdin)"),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Default project key"),
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Default repo slug"),
+    defaults: Optional[str] = typer.Option(None, "--defaults", help="JSON object or @file with default fields"),
+    concurrency: int = typer.Option(1, "--concurrency", "-c", help="Number of concurrent requests"),
+    continue_on_error: bool = typer.Option(True, "--continue-on-error/--stop-on-error"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON results"),
+):
+    """Batch remove participants from pull requests."""
+    _batch_execute(
+        file=file,
+        project=project,
+        repo=repo,
+        defaults=defaults,
+        concurrency=concurrency,
+        continue_on_error=continue_on_error,
+        json_out=json_out,
+        op=_batch_op_pr_participants_remove,
+    )
+
+
+@batch_pr_participants_app.command("status")
+def pr_batch_participants_status(
+    file: str = typer.Option(..., "--file", "-f", help="Path to JSON list (or '-' for stdin)"),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Default project key"),
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Default repo slug"),
+    defaults: Optional[str] = typer.Option(None, "--defaults", help="JSON object or @file with default fields"),
+    concurrency: int = typer.Option(1, "--concurrency", "-c", help="Number of concurrent requests"),
+    continue_on_error: bool = typer.Option(True, "--continue-on-error/--stop-on-error"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON results"),
+):
+    """Batch update participant status on pull requests."""
+    _batch_execute(
+        file=file,
+        project=project,
+        repo=repo,
+        defaults=defaults,
+        concurrency=concurrency,
+        continue_on_error=continue_on_error,
+        json_out=json_out,
+        op=_batch_op_pr_participants_status,
+    )
+
+
+@batch_pr_comments_app.command("add")
+def pr_batch_comments_add(
+    file: str = typer.Option(..., "--file", "-f", help="Path to JSON list (or '-' for stdin)"),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Default project key"),
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Default repo slug"),
+    defaults: Optional[str] = typer.Option(None, "--defaults", help="JSON object or @file with default fields"),
+    concurrency: int = typer.Option(1, "--concurrency", "-c", help="Number of concurrent requests"),
+    continue_on_error: bool = typer.Option(True, "--continue-on-error/--stop-on-error"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON results"),
+):
+    """Batch add comments to pull requests."""
+    _batch_execute(
+        file=file,
+        project=project,
+        repo=repo,
+        defaults=defaults,
+        concurrency=concurrency,
+        continue_on_error=continue_on_error,
+        json_out=json_out,
+        op=_batch_op_pr_comments_add,
+    )
+
+
+@batch_pr_comments_app.command("get")
+def pr_batch_comments_get(
+    file: str = typer.Option(..., "--file", "-f", help="Path to JSON list (or '-' for stdin)"),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Default project key"),
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Default repo slug"),
+    defaults: Optional[str] = typer.Option(None, "--defaults", help="JSON object or @file with default fields"),
+    concurrency: int = typer.Option(1, "--concurrency", "-c", help="Number of concurrent requests"),
+    continue_on_error: bool = typer.Option(True, "--continue-on-error/--stop-on-error"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON results"),
+):
+    """Batch get pull request comments."""
+    _batch_execute(
+        file=file,
+        project=project,
+        repo=repo,
+        defaults=defaults,
+        concurrency=concurrency,
+        continue_on_error=continue_on_error,
+        json_out=json_out,
+        op=_batch_op_pr_comments_get,
+    )
+
+
+@batch_pr_comments_app.command("update")
+def pr_batch_comments_update(
+    file: str = typer.Option(..., "--file", "-f", help="Path to JSON list (or '-' for stdin)"),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Default project key"),
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Default repo slug"),
+    defaults: Optional[str] = typer.Option(None, "--defaults", help="JSON object or @file with default fields"),
+    concurrency: int = typer.Option(1, "--concurrency", "-c", help="Number of concurrent requests"),
+    continue_on_error: bool = typer.Option(True, "--continue-on-error/--stop-on-error"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON results"),
+):
+    """Batch update pull request comments."""
+    _batch_execute(
+        file=file,
+        project=project,
+        repo=repo,
+        defaults=defaults,
+        concurrency=concurrency,
+        continue_on_error=continue_on_error,
+        json_out=json_out,
+        op=_batch_op_pr_comments_update,
+    )
+
+
+@batch_pr_comments_app.command("delete")
+def pr_batch_comments_delete(
+    file: str = typer.Option(..., "--file", "-f", help="Path to JSON list (or '-' for stdin)"),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Default project key"),
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Default repo slug"),
+    defaults: Optional[str] = typer.Option(None, "--defaults", help="JSON object or @file with default fields"),
+    concurrency: int = typer.Option(1, "--concurrency", "-c", help="Number of concurrent requests"),
+    continue_on_error: bool = typer.Option(True, "--continue-on-error/--stop-on-error"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON results"),
+):
+    """Batch delete pull request comments."""
+    _batch_execute(
+        file=file,
+        project=project,
+        repo=repo,
+        defaults=defaults,
+        concurrency=concurrency,
+        continue_on_error=continue_on_error,
+        json_out=json_out,
+        op=_batch_op_pr_comments_delete,
+    )
+
+
+@batch_pr_comments_app.command("apply-suggestion")
+def pr_batch_comments_apply_suggestion(
+    file: str = typer.Option(..., "--file", "-f", help="Path to JSON list (or '-' for stdin)"),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Default project key"),
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Default repo slug"),
+    defaults: Optional[str] = typer.Option(None, "--defaults", help="JSON object or @file with default fields"),
+    concurrency: int = typer.Option(1, "--concurrency", "-c", help="Number of concurrent requests"),
+    continue_on_error: bool = typer.Option(True, "--continue-on-error/--stop-on-error"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON results"),
+):
+    """Batch apply suggestions from pull request comments."""
+    _batch_execute(
+        file=file,
+        project=project,
+        repo=repo,
+        defaults=defaults,
+        concurrency=concurrency,
+        continue_on_error=continue_on_error,
+        json_out=json_out,
+        op=_batch_op_pr_comments_apply_suggestion,
+    )
+
+
+@batch_pr_comments_app.command("react")
+def pr_batch_comments_react(
+    file: str = typer.Option(..., "--file", "-f", help="Path to JSON list (or '-' for stdin)"),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Default project key"),
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Default repo slug"),
+    defaults: Optional[str] = typer.Option(None, "--defaults", help="JSON object or @file with default fields"),
+    concurrency: int = typer.Option(1, "--concurrency", "-c", help="Number of concurrent requests"),
+    continue_on_error: bool = typer.Option(True, "--continue-on-error/--stop-on-error"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON results"),
+):
+    """Batch react to pull request comments."""
+    _batch_execute(
+        file=file,
+        project=project,
+        repo=repo,
+        defaults=defaults,
+        concurrency=concurrency,
+        continue_on_error=continue_on_error,
+        json_out=json_out,
+        op=_batch_op_pr_comments_react,
+    )
+
+
+@batch_pr_comments_app.command("unreact")
+def pr_batch_comments_unreact(
+    file: str = typer.Option(..., "--file", "-f", help="Path to JSON list (or '-' for stdin)"),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Default project key"),
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Default repo slug"),
+    defaults: Optional[str] = typer.Option(None, "--defaults", help="JSON object or @file with default fields"),
+    concurrency: int = typer.Option(1, "--concurrency", "-c", help="Number of concurrent requests"),
+    continue_on_error: bool = typer.Option(True, "--continue-on-error/--stop-on-error"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON results"),
+):
+    """Batch remove reactions from pull request comments."""
+    _batch_execute(
+        file=file,
+        project=project,
+        repo=repo,
+        defaults=defaults,
+        concurrency=concurrency,
+        continue_on_error=continue_on_error,
+        json_out=json_out,
+        op=_batch_op_pr_comments_unreact,
+    )
+
+
+@batch_pr_blockers_app.command("add")
+def pr_batch_blockers_add(
+    file: str = typer.Option(..., "--file", "-f", help="Path to JSON list (or '-' for stdin)"),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Default project key"),
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Default repo slug"),
+    defaults: Optional[str] = typer.Option(None, "--defaults", help="JSON object or @file with default fields"),
+    concurrency: int = typer.Option(1, "--concurrency", "-c", help="Number of concurrent requests"),
+    continue_on_error: bool = typer.Option(True, "--continue-on-error/--stop-on-error"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON results"),
+):
+    """Batch add blocker comments to pull requests."""
+    _batch_execute(
+        file=file,
+        project=project,
+        repo=repo,
+        defaults=defaults,
+        concurrency=concurrency,
+        continue_on_error=continue_on_error,
+        json_out=json_out,
+        op=_batch_op_pr_blockers_add,
+    )
+
+
+@batch_pr_blockers_app.command("get")
+def pr_batch_blockers_get(
+    file: str = typer.Option(..., "--file", "-f", help="Path to JSON list (or '-' for stdin)"),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Default project key"),
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Default repo slug"),
+    defaults: Optional[str] = typer.Option(None, "--defaults", help="JSON object or @file with default fields"),
+    concurrency: int = typer.Option(1, "--concurrency", "-c", help="Number of concurrent requests"),
+    continue_on_error: bool = typer.Option(True, "--continue-on-error/--stop-on-error"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON results"),
+):
+    """Batch get blocker comments."""
+    _batch_execute(
+        file=file,
+        project=project,
+        repo=repo,
+        defaults=defaults,
+        concurrency=concurrency,
+        continue_on_error=continue_on_error,
+        json_out=json_out,
+        op=_batch_op_pr_blockers_get,
+    )
+
+
+@batch_pr_blockers_app.command("update")
+def pr_batch_blockers_update(
+    file: str = typer.Option(..., "--file", "-f", help="Path to JSON list (or '-' for stdin)"),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Default project key"),
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Default repo slug"),
+    defaults: Optional[str] = typer.Option(None, "--defaults", help="JSON object or @file with default fields"),
+    concurrency: int = typer.Option(1, "--concurrency", "-c", help="Number of concurrent requests"),
+    continue_on_error: bool = typer.Option(True, "--continue-on-error/--stop-on-error"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON results"),
+):
+    """Batch update blocker comments."""
+    _batch_execute(
+        file=file,
+        project=project,
+        repo=repo,
+        defaults=defaults,
+        concurrency=concurrency,
+        continue_on_error=continue_on_error,
+        json_out=json_out,
+        op=_batch_op_pr_blockers_update,
+    )
+
+
+@batch_pr_blockers_app.command("delete")
+def pr_batch_blockers_delete(
+    file: str = typer.Option(..., "--file", "-f", help="Path to JSON list (or '-' for stdin)"),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Default project key"),
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Default repo slug"),
+    defaults: Optional[str] = typer.Option(None, "--defaults", help="JSON object or @file with default fields"),
+    concurrency: int = typer.Option(1, "--concurrency", "-c", help="Number of concurrent requests"),
+    continue_on_error: bool = typer.Option(True, "--continue-on-error/--stop-on-error"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON results"),
+):
+    """Batch delete blocker comments."""
+    _batch_execute(
+        file=file,
+        project=project,
+        repo=repo,
+        defaults=defaults,
+        concurrency=concurrency,
+        continue_on_error=continue_on_error,
+        json_out=json_out,
+        op=_batch_op_pr_blockers_delete,
+    )
+
+
+@batch_pr_review_app.command("get")
+def pr_batch_review_get(
+    file: str = typer.Option(..., "--file", "-f", help="Path to JSON list (or '-' for stdin)"),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Default project key"),
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Default repo slug"),
+    defaults: Optional[str] = typer.Option(None, "--defaults", help="JSON object or @file with default fields"),
+    concurrency: int = typer.Option(1, "--concurrency", "-c", help="Number of concurrent requests"),
+    continue_on_error: bool = typer.Option(True, "--continue-on-error/--stop-on-error"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON results"),
+):
+    """Batch get review data for pull requests."""
+    _batch_execute(
+        file=file,
+        project=project,
+        repo=repo,
+        defaults=defaults,
+        concurrency=concurrency,
+        continue_on_error=continue_on_error,
+        json_out=json_out,
+        op=_batch_op_pr_review_get,
+    )
+
+
+@batch_pr_review_app.command("complete")
+def pr_batch_review_complete(
+    file: str = typer.Option(..., "--file", "-f", help="Path to JSON list (or '-' for stdin)"),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Default project key"),
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Default repo slug"),
+    defaults: Optional[str] = typer.Option(None, "--defaults", help="JSON object or @file with default fields"),
+    concurrency: int = typer.Option(1, "--concurrency", "-c", help="Number of concurrent requests"),
+    continue_on_error: bool = typer.Option(True, "--continue-on-error/--stop-on-error"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON results"),
+):
+    """Batch complete reviews for pull requests."""
+    _batch_execute(
+        file=file,
+        project=project,
+        repo=repo,
+        defaults=defaults,
+        concurrency=concurrency,
+        continue_on_error=continue_on_error,
+        json_out=json_out,
+        op=_batch_op_pr_review_complete,
+    )
+
+
+@batch_pr_review_app.command("discard")
+def pr_batch_review_discard(
+    file: str = typer.Option(..., "--file", "-f", help="Path to JSON list (or '-' for stdin)"),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Default project key"),
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Default repo slug"),
+    defaults: Optional[str] = typer.Option(None, "--defaults", help="JSON object or @file with default fields"),
+    concurrency: int = typer.Option(1, "--concurrency", "-c", help="Number of concurrent requests"),
+    continue_on_error: bool = typer.Option(True, "--continue-on-error/--stop-on-error"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON results"),
+):
+    """Batch discard reviews for pull requests."""
+    _batch_execute(
+        file=file,
+        project=project,
+        repo=repo,
+        defaults=defaults,
+        concurrency=concurrency,
+        continue_on_error=continue_on_error,
+        json_out=json_out,
+        op=_batch_op_pr_review_discard,
+    )
+
+
+@batch_pr_auto_merge_app.command("get")
+def pr_batch_auto_merge_get(
+    file: str = typer.Option(..., "--file", "-f", help="Path to JSON list (or '-' for stdin)"),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Default project key"),
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Default repo slug"),
+    defaults: Optional[str] = typer.Option(None, "--defaults", help="JSON object or @file with default fields"),
+    concurrency: int = typer.Option(1, "--concurrency", "-c", help="Number of concurrent requests"),
+    continue_on_error: bool = typer.Option(True, "--continue-on-error/--stop-on-error"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON results"),
+):
+    """Batch get auto-merge requests."""
+    _batch_execute(
+        file=file,
+        project=project,
+        repo=repo,
+        defaults=defaults,
+        concurrency=concurrency,
+        continue_on_error=continue_on_error,
+        json_out=json_out,
+        op=_batch_op_pr_auto_merge_get,
+    )
+
+
+@batch_pr_auto_merge_app.command("set")
+def pr_batch_auto_merge_set(
+    file: str = typer.Option(..., "--file", "-f", help="Path to JSON list (or '-' for stdin)"),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Default project key"),
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Default repo slug"),
+    defaults: Optional[str] = typer.Option(None, "--defaults", help="JSON object or @file with default fields"),
+    concurrency: int = typer.Option(1, "--concurrency", "-c", help="Number of concurrent requests"),
+    continue_on_error: bool = typer.Option(True, "--continue-on-error/--stop-on-error"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON results"),
+):
+    """Batch request auto-merge for pull requests."""
+    _batch_execute(
+        file=file,
+        project=project,
+        repo=repo,
+        defaults=defaults,
+        concurrency=concurrency,
+        continue_on_error=continue_on_error,
+        json_out=json_out,
+        op=_batch_op_pr_auto_merge_set,
+    )
+
+
+@batch_pr_auto_merge_app.command("cancel")
+def pr_batch_auto_merge_cancel(
+    file: str = typer.Option(..., "--file", "-f", help="Path to JSON list (or '-' for stdin)"),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Default project key"),
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Default repo slug"),
+    defaults: Optional[str] = typer.Option(None, "--defaults", help="JSON object or @file with default fields"),
+    concurrency: int = typer.Option(1, "--concurrency", "-c", help="Number of concurrent requests"),
+    continue_on_error: bool = typer.Option(True, "--continue-on-error/--stop-on-error"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON results"),
+):
+    """Batch cancel auto-merge for pull requests."""
+    _batch_execute(
+        file=file,
+        project=project,
+        repo=repo,
+        defaults=defaults,
+        concurrency=concurrency,
+        continue_on_error=continue_on_error,
+        json_out=json_out,
+        op=_batch_op_pr_auto_merge_cancel,
+    )
 
 
 @app.command("doctor")

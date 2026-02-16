@@ -86,6 +86,47 @@ bbdc pr for-commit --project <KEY> --repo <SLUG> <commit_id>
                    [--limit N] [--max-items N] [--json]
 ```
 
+Batch operations:
+
+Batch commands read a JSON list of objects from `--file` (or `-` for stdin). Common options:
+
+- `--file <path|->` (required)
+- `[--project <KEY>] [--repo <SLUG>]` default fields applied to each item
+- `[--defaults <json|@file>]` additional default fields (JSON object or `@` file)
+- `[--concurrency N]` (default 1)
+- `[--continue-on-error|--stop-on-error]` (default continue)
+- `[--json]` print raw JSON results
+
+Item fields mirror the corresponding command options using snake_case (e.g., `pr_id`, `from_branch`). Reviewers can be
+provided as `reviewers` (list) or `reviewer` (single). Version fields are optional; when omitted, the CLI will fetch
+the current version from the server where required. Per-item fields override defaults; command-line defaults override
+`--defaults`.
+
+Batch is provided for single-entity actions and simple GETs. Paged list and streaming endpoints (e.g., list/activities/
+changes/commits/diff/patch) remain per-invocation.
+
+Batch pull requests:
+
+```
+bbdc pr batch get --file <path>
+bbdc pr batch create --file <path>
+bbdc pr batch comment --file <path>
+bbdc pr batch approve --file <path>
+bbdc pr batch unapprove --file <path>
+bbdc pr batch decline --file <path>
+bbdc pr batch reopen --file <path>
+bbdc pr batch merge-check --file <path>
+bbdc pr batch merge --file <path>
+bbdc pr batch update --file <path>
+bbdc pr batch watch --file <path>
+bbdc pr batch unwatch --file <path>
+bbdc pr batch merge-base --file <path>
+bbdc pr batch commit-message --file <path>
+bbdc pr batch rebase-check --file <path>
+bbdc pr batch rebase --file <path>
+bbdc pr batch delete --file <path>
+```
+
 Participants:
 
 ```
@@ -105,6 +146,10 @@ bbdc pr participants search --project <KEY> --repo <SLUG>
                            [--filter <text>] [--role AUTHOR|REVIEWER|PARTICIPANT]
                            [--direction INCOMING|OUTGOING]
                            [--limit N] [--max-items N] [--json]
+
+bbdc pr batch participants add --file <path>
+bbdc pr batch participants remove --file <path>
+bbdc pr batch participants status --file <path>
 ```
 
 Comments:
@@ -135,6 +180,14 @@ bbdc pr comments apply-suggestion --project <KEY> --repo <SLUG> <pr_id> <comment
 bbdc pr comments react --project <KEY> --repo <SLUG> <pr_id> <comment_id> --emoticon ":+1:"
 
 bbdc pr comments unreact --project <KEY> --repo <SLUG> <pr_id> <comment_id> --emoticon ":+1:"
+
+bbdc pr batch comments add --file <path>
+bbdc pr batch comments get --file <path>
+bbdc pr batch comments update --file <path>
+bbdc pr batch comments delete --file <path>
+bbdc pr batch comments apply-suggestion --file <path>
+bbdc pr batch comments react --file <path>
+bbdc pr batch comments unreact --file <path>
 ```
 
 Blocker comments:
@@ -154,6 +207,11 @@ bbdc pr blockers update --project <KEY> --repo <SLUG> <pr_id> <comment_id>
 
 bbdc pr blockers delete --project <KEY> --repo <SLUG> <pr_id> <comment_id>
                         [--version N]
+
+bbdc pr batch blockers add --file <path>
+bbdc pr batch blockers get --file <path>
+bbdc pr batch blockers update --file <path>
+bbdc pr batch blockers delete --file <path>
 ```
 
 Review:
@@ -166,6 +224,10 @@ bbdc pr review complete --project <KEY> --repo <SLUG> <pr_id>
                         [--status UNAPPROVED|NEEDS_WORK|APPROVED] [--json]
 
 bbdc pr review discard --project <KEY> --repo <SLUG> <pr_id>
+
+bbdc pr batch review get --file <path>
+bbdc pr batch review complete --file <path>
+bbdc pr batch review discard --file <path>
 ```
 
 Auto-merge:
@@ -176,4 +238,8 @@ bbdc pr auto-merge get --project <KEY> --repo <SLUG> <pr_id>
 bbdc pr auto-merge set --project <KEY> --repo <SLUG> <pr_id>
 
 bbdc pr auto-merge cancel --project <KEY> --repo <SLUG> <pr_id>
+
+bbdc pr batch auto-merge get --file <path>
+bbdc pr batch auto-merge set --file <path>
+bbdc pr batch auto-merge cancel --file <path>
 ```

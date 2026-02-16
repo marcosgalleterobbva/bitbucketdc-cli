@@ -143,6 +143,24 @@ bbdc pr review complete -p GL_KAIF_APP-ID-2866825_DSG -r mercury-viz 123 --comme
 bbdc pr comments add -p GL_KAIF_APP-ID-2866825_DSG -r mercury-viz 123 --text "LGTM"
 ```
 
+## Batch operations
+
+Batch commands live under `bbdc pr batch ...` and read a JSON list of items from `--file` (or `-` for stdin). You can
+provide `--project` and `--repo` as defaults for each item.
+
+Example batch approvals (`approve.json`):
+
+```json
+[
+  {"pr_id": 123},
+  {"pr_id": 456}
+]
+```
+
+```bash
+bbdc pr batch approve -p GL_KAIF_APP-ID-2866825_DSG -r mercury-viz -f approve.json
+```
+
 Diffs and commits:
 
 ```bash

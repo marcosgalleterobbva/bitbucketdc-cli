@@ -92,3 +92,45 @@ bbdc pr merge -p GL_KAIF_APP-ID-2866825_DSG -r mercury-viz 123 --message "LGTM"
 ```bash
 bbdc pr for-commit -p GL_KAIF_APP-ID-2866825_DSG -r mercury-viz 8d51122def56
 ```
+
+## Batch create PRs
+
+Example batch file (`batch-prs.json`):
+
+```json
+[
+  {
+    "from_branch": "feature/one",
+    "to_branch": "develop",
+    "title": "Add feature one",
+    "description": "Implements feature one",
+    "reviewers": ["alice", "bob"]
+  },
+  {
+    "from_branch": "feature/two",
+    "to_branch": "develop",
+    "title": "Add feature two",
+    "draft": true
+  }
+]
+```
+
+Run (defaults apply to each item):
+
+```bash
+bbdc pr batch create -p GL_KAIF_APP-ID-2866825_DSG -r mercury-viz -f batch-prs.json
+```
+
+## Batch approve PRs
+
+```json
+[
+  {"pr_id": 123},
+  {"pr_id": 456},
+  {"pr_id": 789}
+]
+```
+
+```bash
+bbdc pr batch approve -p GL_KAIF_APP-ID-2866825_DSG -r mercury-viz -f approve.json
+```
