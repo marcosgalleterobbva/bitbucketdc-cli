@@ -2,6 +2,8 @@
 
 This is the authoritative command reference derived from `bbdc_cli/__main__.py`.
 
+Codex runtime note: if commands fail in Codex with DNS/network errors (for example `NameResolutionError`), run the same `bbdc` commands in your local terminal and share output back to Codex.
+
 Global:
 
 ```

@@ -209,6 +209,19 @@ Recommended split of responsibilities:
 
 This separation is the correct approach and avoids coupling Codex behavior to package release timing.
 
+### Codex runtime execution caveat
+
+Some Codex runtimes may not have DNS/VPN/network access to your Bitbucket host. In those contexts, `bbdc` execution
+from Codex can fail even though the same command works on the user's machine.
+
+Typical error:
+- `Request failed: HTTPSConnectionPool(... NameResolutionError ... Failed to resolve ...)`
+
+Recommended workflow in Codex:
+1. Codex generates exact `bbdc` commands.
+2. User runs commands locally in their terminal.
+3. User shares output back to Codex for analysis or next steps.
+
 ## Troubleshooting
 
 `BITBUCKET_SERVER` must end with `/rest`.
