@@ -36,12 +36,14 @@ import requests
 import typer
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
+account_app = typer.Typer(no_args_is_help=True, add_completion=False)
 pr_app = typer.Typer(no_args_is_help=True, add_completion=False)
 participants_app = typer.Typer(no_args_is_help=True, add_completion=False)
 comments_app = typer.Typer(no_args_is_help=True, add_completion=False)
 blockers_app = typer.Typer(no_args_is_help=True, add_completion=False)
 review_app = typer.Typer(no_args_is_help=True, add_completion=False)
 auto_merge_app = typer.Typer(no_args_is_help=True, add_completion=False)
+app.add_typer(account_app, name="account", help="Authenticated account operations")
 app.add_typer(pr_app, name="pr", help="Pull request operations")
 pr_app.add_typer(participants_app, name="participants", help="PR participants and reviewers")
 pr_app.add_typer(comments_app, name="comments", help="PR comments")
@@ -223,6 +225,32 @@ class BitbucketClient:
             if start is None:
                 return out
 
+    def paged_get_rest(
+        self,
+        path: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        limit: int = 50,
+        max_items: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """Fetch paged results from non-/api/latest REST namespaces."""
+        out: List[Dict[str, Any]] = []
+        start = 0
+        params = dict(params or {})
+        while True:
+            params.update({"start": start, "limit": limit})
+            page = self.request_rest("GET", path, params=params)
+            values = page.get("values", [])
+            if isinstance(values, list):
+                out.extend(values)
+            if len(out) >= max_items:
+                return out[:max_items]
+            if page.get("isLastPage", True):
+                return out
+            start = page.get("nextPageStart")
+            if start is None:
+                return out
+
 
 def client() -> BitbucketClient:
     return BitbucketClient(
@@ -294,6 +322,102 @@ def _print_participants(items: Iterable[Dict[str, Any]]) -> None:
     typer.echo("  ".join("-" * w for w in widths))
     for r in rows:
         typer.echo(fmt_row(r))
+
+
+def _print_repositories(items: Iterable[Dict[str, Any]]) -> None:
+    rows = []
+    for repo in items:
+        project = repo.get("project") or {}
+        project_key = project.get("key") or ""
+        slug = repo.get("slug") or ""
+        name = repo.get("name") or ""
+        rows.append((project_key, slug, name))
+
+    if not rows:
+        typer.echo("No repositories found.")
+        return
+
+    headers = ("PROJECT", "REPO", "NAME")
+    widths = [len(h) for h in headers]
+    for r in rows:
+        for i, cell in enumerate(r):
+            widths[i] = max(widths[i], len(cell))
+
+    def fmt_row(r):
+        return "  ".join(cell.ljust(widths[i]) for i, cell in enumerate(r))
+
+    typer.echo(fmt_row(headers))
+    typer.echo("  ".join("-" * w for w in widths))
+    for r in rows:
+        typer.echo(fmt_row(r))
+
+
+def _print_ssh_keys(items: Iterable[Dict[str, Any]]) -> None:
+    rows = []
+    for key in items:
+        key_id = str(key.get("id", ""))
+        label = key.get("label") or ""
+        algorithm = key.get("algorithmType") or ""
+        warning = key.get("warning") or ""
+        rows.append((key_id, label, algorithm, warning))
+
+    if not rows:
+        typer.echo("No SSH keys found.")
+        return
+
+    headers = ("ID", "LABEL", "ALGO", "WARNING")
+    widths = [len(h) for h in headers]
+    for r in rows:
+        for i, cell in enumerate(r):
+            widths[i] = max(widths[i], len(cell))
+
+    def fmt_row(r):
+        return "  ".join(cell.ljust(widths[i]) for i, cell in enumerate(r))
+
+    typer.echo(fmt_row(headers))
+    typer.echo("  ".join("-" * w for w in widths))
+    for r in rows:
+        typer.echo(fmt_row(r))
+
+
+def _print_gpg_keys(items: Iterable[Dict[str, Any]]) -> None:
+    rows = []
+    for key in items:
+        key_id = str(key.get("id", ""))
+        email = key.get("emailAddress") or ""
+        fingerprint = key.get("fingerprint") or ""
+        rows.append((key_id, email, fingerprint))
+
+    if not rows:
+        typer.echo("No GPG keys found.")
+        return
+
+    headers = ("ID", "EMAIL", "FINGERPRINT")
+    widths = [len(h) for h in headers]
+    for r in rows:
+        for i, cell in enumerate(r):
+            widths[i] = max(widths[i], len(cell))
+
+    def fmt_row(r):
+        return "  ".join(cell.ljust(widths[i]) for i, cell in enumerate(r))
+
+    typer.echo(fmt_row(headers))
+    typer.echo("  ".join("-" * w for w in widths))
+    for r in rows:
+        typer.echo(fmt_row(r))
+
+
+def _resolve_user_slug(user_slug: Optional[str]) -> str:
+    if user_slug:
+        return user_slug.strip()
+    for name in ("BITBUCKET_USER_SLUG", "BITBUCKET_USERNAME", "BITBUCKET_USER"):
+        value = os.getenv(name, "").strip()
+        if value:
+            return value
+    raise BBError(
+        "Unable to resolve current user slug. Pass --user-slug or set BITBUCKET_USER_SLUG "
+        "(or BITBUCKET_USERNAME / BITBUCKET_USER)."
+    )
 
 
 ROLE_CHOICES = {"AUTHOR", "REVIEWER", "PARTICIPANT"}
@@ -1113,6 +1237,86 @@ def _op_pr_auto_merge_cancel(
     return {"message": f"Cancelled auto-merge for PR #{pr_id}"}
 
 
+def _op_account_recent_repos(
+    bb: BitbucketClient, limit: int, max_items: int
+) -> Dict[str, Any]:
+    repos = bb.paged_get("profile/recent/repos", limit=limit, max_items=max_items)
+    return {"message": f"Fetched {len(repos)} recently accessed repositories", "data": repos}
+
+
+def _op_account_ssh_keys(
+    bb: BitbucketClient, user: Optional[str], limit: int, max_items: int
+) -> Dict[str, Any]:
+    params = {"user": user} if user else None
+    keys = bb.paged_get_rest("ssh/latest/keys", params=params, limit=limit, max_items=max_items)
+    who = user or "current user"
+    return {"message": f"Fetched {len(keys)} SSH keys for {who}", "data": keys}
+
+
+def _op_account_gpg_keys(
+    bb: BitbucketClient, user: Optional[str], limit: int, max_items: int
+) -> Dict[str, Any]:
+    params = {"user": user} if user else None
+    keys = bb.paged_get_rest("gpg/latest/keys", params=params, limit=limit, max_items=max_items)
+    who = user or "current user"
+    return {"message": f"Fetched {len(keys)} GPG keys for {who}", "data": keys}
+
+
+def _op_account_user(bb: BitbucketClient, user_slug: str) -> Dict[str, Any]:
+    path = f"users/{user_slug}"
+    user = bb.request("GET", path)
+    return {"message": f"Fetched user '{user_slug}'", "data": user}
+
+
+def _op_account_user_settings(bb: BitbucketClient, user_slug: str) -> Dict[str, Any]:
+    path = f"users/{user_slug}/settings"
+    settings = bb.request("GET", path)
+    return {"message": f"Fetched settings for user '{user_slug}'", "data": settings}
+
+
+def _op_account_me(
+    bb: BitbucketClient,
+    *,
+    user_slug: Optional[str],
+    include_profile: bool,
+    include_settings: bool,
+    limit: int,
+    max_items: int,
+) -> Dict[str, Any]:
+    recent_repos = _op_account_recent_repos(bb, limit=limit, max_items=max_items)["data"]
+    ssh_keys = _op_account_ssh_keys(bb, user=None, limit=limit, max_items=max_items)["data"]
+    gpg_keys = _op_account_gpg_keys(bb, user=None, limit=limit, max_items=max_items)["data"]
+
+    resolved_user_slug: Optional[str] = None
+    user_profile: Optional[Dict[str, Any]] = None
+    user_settings: Optional[Dict[str, Any]] = None
+    if include_profile or include_settings:
+        resolved_user_slug = _resolve_user_slug(user_slug)
+        if include_profile:
+            user_profile = _op_account_user(bb, resolved_user_slug)["data"]
+        if include_settings:
+            user_settings = _op_account_user_settings(bb, resolved_user_slug)["data"]
+
+    payload: Dict[str, Any] = {
+        "counts": {
+            "recent_repos": len(recent_repos),
+            "ssh_keys": len(ssh_keys),
+            "gpg_keys": len(gpg_keys),
+        },
+        "recent_repositories": recent_repos,
+        "ssh_keys": ssh_keys,
+        "gpg_keys": gpg_keys,
+    }
+    if resolved_user_slug:
+        payload["resolved_user_slug"] = resolved_user_slug
+    if user_profile is not None:
+        payload["user"] = user_profile
+    if user_settings is not None:
+        payload["settings"] = user_settings
+
+    return {"message": "Fetched authenticated account information", "data": payload}
+
+
 def _batch_op_pr_get(bb: BitbucketClient, item: Dict[str, Any]) -> Dict[str, Any]:
     project, repo, pr_id = _item_pr(item)
     return _op_pr_get(bb, project, repo, pr_id)
@@ -1382,6 +1586,116 @@ def _batch_op_pr_auto_merge_set(bb: BitbucketClient, item: Dict[str, Any]) -> Di
 def _batch_op_pr_auto_merge_cancel(bb: BitbucketClient, item: Dict[str, Any]) -> Dict[str, Any]:
     project, repo, pr_id = _item_pr(item)
     return _op_pr_auto_merge_cancel(bb, project, repo, pr_id)
+
+
+@account_app.command("recent-repos")
+def account_recent_repos(
+    limit: int = typer.Option(50, help="Page size"),
+    max_items: int = typer.Option(200, help="Max items to fetch across pages"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON response"),
+):
+    """Get recently accessed repositories for the authenticated user."""
+    bb = client()
+    resp = _op_account_recent_repos(bb, limit=limit, max_items=max_items)
+    if json_out:
+        _print_json(resp["data"])
+    else:
+        _print_repositories(resp["data"])
+
+
+@account_app.command("ssh-keys")
+def account_ssh_keys(
+    user: Optional[str] = typer.Option(None, "--user", help="Optional user slug/name; defaults to current user"),
+    limit: int = typer.Option(50, help="Page size"),
+    max_items: int = typer.Option(200, help="Max items to fetch across pages"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON response"),
+):
+    """Get SSH keys for the authenticated user (or another user with sufficient permissions)."""
+    bb = client()
+    resp = _op_account_ssh_keys(bb, user=user, limit=limit, max_items=max_items)
+    if json_out:
+        _print_json(resp["data"])
+    else:
+        _print_ssh_keys(resp["data"])
+
+
+@account_app.command("gpg-keys")
+def account_gpg_keys(
+    user: Optional[str] = typer.Option(None, "--user", help="Optional user slug/name; defaults to current user"),
+    limit: int = typer.Option(50, help="Page size"),
+    max_items: int = typer.Option(200, help="Max items to fetch across pages"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON response"),
+):
+    """Get GPG keys for the authenticated user (or another user with sufficient permissions)."""
+    bb = client()
+    resp = _op_account_gpg_keys(bb, user=user, limit=limit, max_items=max_items)
+    if json_out:
+        _print_json(resp["data"])
+    else:
+        _print_gpg_keys(resp["data"])
+
+
+@account_app.command("user")
+def account_user(
+    user_slug: Optional[str] = typer.Option(
+        None,
+        "--user-slug",
+        help="User slug. If omitted, resolves from BITBUCKET_USER_SLUG / BITBUCKET_USERNAME / BITBUCKET_USER.",
+    ),
+):
+    """Get user details for the authenticated user account (or a supplied user slug)."""
+    bb = client()
+    slug = _resolve_user_slug(user_slug)
+    resp = _op_account_user(bb, slug)
+    _print_json(resp["data"])
+
+
+@account_app.command("settings")
+def account_settings(
+    user_slug: Optional[str] = typer.Option(
+        None,
+        "--user-slug",
+        help="User slug. If omitted, resolves from BITBUCKET_USER_SLUG / BITBUCKET_USERNAME / BITBUCKET_USER.",
+    ),
+):
+    """Get account settings for the authenticated user account (or a supplied user slug)."""
+    bb = client()
+    slug = _resolve_user_slug(user_slug)
+    resp = _op_account_user_settings(bb, slug)
+    _print_json(resp["data"])
+
+
+@account_app.command("me")
+def account_me(
+    user_slug: Optional[str] = typer.Option(
+        None,
+        "--user-slug",
+        help="Optional user slug used when profile/settings are requested.",
+    ),
+    include_profile: bool = typer.Option(
+        True,
+        "--include-profile/--no-include-profile",
+        help="Include /api/latest/users/{userSlug} details.",
+    ),
+    include_settings: bool = typer.Option(
+        False,
+        "--include-settings/--no-include-settings",
+        help="Include /api/latest/users/{userSlug}/settings.",
+    ),
+    limit: int = typer.Option(25, help="Page size for account-related paged endpoints"),
+    max_items: int = typer.Option(100, help="Max items per account-related endpoint"),
+):
+    """Get a consolidated snapshot of the authenticated account (repos, SSH keys, GPG keys)."""
+    bb = client()
+    resp = _op_account_me(
+        bb,
+        user_slug=user_slug,
+        include_profile=include_profile,
+        include_settings=include_settings,
+        limit=limit,
+        max_items=max_items,
+    )
+    _print_json(resp["data"])
 
 
 @pr_app.command("list")
@@ -3208,16 +3522,31 @@ def pr_batch_auto_merge_cancel(
 
 
 @app.command("doctor")
-def doctor():
+def doctor(
+    json_out: bool = typer.Option(False, "--json", help="Print machine-readable JSON status"),
+):
     """Sanity checks: validates env vars and hits a lightweight endpoint."""
     bb = client()
     # Hit an endpoint that typically requires only auth and returns quickly.
     # We'll use dashboard pull-requests (even if empty) as a general check.
     resp = bb.request("GET", "dashboard/pull-requests", params={"limit": 1, "start": 0})
     # If we got here, auth + base URL are OK.
+    visible = 0
+    if isinstance(resp, dict) and "values" in resp and isinstance(resp.get("values"), list):
+        visible = len(resp.get("values") or [])
+
+    if json_out:
+        _print_json(
+            {
+                "ok": True,
+                "message": "BITBUCKET_SERVER and BITBUCKET_API_TOKEN look usable.",
+                "dashboard_prs_visible_first_page": visible,
+            }
+        )
+        return
+
     typer.echo("OK: BITBUCKET_SERVER and BITBUCKET_API_TOKEN look usable.")
-    if isinstance(resp, dict) and "values" in resp:
-        typer.echo(f"Dashboard PRs visible: {len(resp.get('values') or [])} item(s) on first page.")
+    typer.echo(f"Dashboard PRs visible: {visible} item(s) on first page.")
 
 
 def main() -> None:

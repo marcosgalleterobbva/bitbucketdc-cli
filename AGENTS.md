@@ -25,6 +25,7 @@ bbdc doctor
 Top-level:
 
 - `bbdc doctor`
+- `bbdc account me|recent-repos|ssh-keys|gpg-keys|user|settings`
 
 Pull requests:
 
@@ -101,4 +102,3 @@ Follow these patterns in `bbdc_cli/__main__.py`:
 - `docs/CLI.md`: complete command reference
 - `docs/examples.md`: common workflows
 - `docs/coverage.md`: OpenAPI/Postman coverage summary and gaps
-

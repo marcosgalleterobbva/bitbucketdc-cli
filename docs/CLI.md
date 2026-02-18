@@ -5,8 +5,33 @@ This is the authoritative command reference derived from `bbdc_cli/__main__.py`.
 Global:
 
 ```
-bbdc doctor
+bbdc doctor [--json]
 ```
+
+Account:
+
+```
+bbdc account recent-repos [--limit N] [--max-items N] [--json]
+
+bbdc account ssh-keys [--user <slug>] [--limit N] [--max-items N] [--json]
+
+bbdc account gpg-keys [--user <slug>] [--limit N] [--max-items N] [--json]
+
+bbdc account user [--user-slug <slug>]
+
+bbdc account settings [--user-slug <slug>]
+
+bbdc account me [--user-slug <slug>]
+                [--include-profile|--no-include-profile]
+                [--include-settings|--no-include-settings]
+                [--limit N] [--max-items N]
+```
+
+For `account user`, `account settings`, and profile/settings expansion in `account me`, user slug is resolved from:
+- `--user-slug`
+- `BITBUCKET_USER_SLUG`
+- `BITBUCKET_USERNAME`
+- `BITBUCKET_USER`
 
 Pull requests:
 

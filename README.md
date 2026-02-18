@@ -60,9 +60,15 @@ export BITBUCKET_API_TOKEN="YOUR_TOKEN"
 
 ```bash
 bbdc doctor
+# machine-readable output
+bbdc doctor --json
 ```
 
 If this succeeds, your base URL + token are working.
+
+Optional (for account profile/settings lookups):
+
+- `BITBUCKET_USER_SLUG`: your Bitbucket user slug
 
 ## Common commands
 
@@ -70,7 +76,25 @@ Show help:
 
 ```bash
 bbdc --help
+bbdc account --help
 bbdc pr --help
+```
+
+Get information about your authenticated account:
+
+```bash
+# consolidated snapshot (recent repos + SSH keys + GPG keys)
+bbdc account me
+
+# include user profile and settings when your slug is known
+bbdc account me --user-slug your.user --include-settings
+
+# raw account endpoint calls
+bbdc account recent-repos
+bbdc account ssh-keys
+bbdc account gpg-keys
+bbdc account user --user-slug your.user
+bbdc account settings --user-slug your.user
 ```
 
 List pull requests:
@@ -170,6 +194,20 @@ bbdc pr diff-file -p GL_KAIF_APP-ID-2866825_DSG -r mercury-viz 123 src/main.py
 ```
 
 See the full command reference in `docs/CLI.md` and usage examples in `docs/examples.md`.
+
+## Codex integration
+
+If teammates will use this through Codex with natural language:
+
+1. Distribute this CLI through PyPI (`bbdc-cli`).
+2. Distribute the Codex skill separately (for example, git repo cloned into `$CODEX_HOME/skills/bbdc-cli`).
+3. Keep the skill's command inventory synced with this repo's `bbdc_cli/__main__.py`.
+
+Recommended split of responsibilities:
+- This repo: command behavior, API semantics, package distribution.
+- Skill repo: natural-language intent mapping, execution policy, Codex-specific prompting.
+
+This separation is the correct approach and avoids coupling Codex behavior to package release timing.
 
 ## Troubleshooting
 

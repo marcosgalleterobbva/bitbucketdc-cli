@@ -2,6 +2,23 @@
 
 These examples use a fictional project `GL_KAIF_APP-ID-2866825_DSG` and repo `mercury-viz`.
 
+## Inspect your authenticated account
+
+```bash
+# Consolidated account snapshot (recent repos, SSH keys, GPG keys)
+bbdc account me
+
+# Include profile/settings when your slug is known
+bbdc account me --user-slug alice --include-settings
+
+# Individual account endpoints
+bbdc account recent-repos
+bbdc account ssh-keys
+bbdc account gpg-keys
+bbdc account user --user-slug alice
+bbdc account settings --user-slug alice
+```
+
 ## Review a PR end-to-end
 
 ```bash
