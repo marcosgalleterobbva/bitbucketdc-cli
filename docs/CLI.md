@@ -29,6 +29,8 @@ bbdc account me [--user-slug <slug>]
                 [--limit N] [--max-items N]
 ```
 
+Note: `account me` has no `--json` option. It already prints JSON output by default.
+
 Token behavior (BBVA):
 - Project/Repository HTTP access tokens may return `401` for user-account endpoints:
   `account ssh-keys`, `account gpg-keys`, `account user`, `account settings`.

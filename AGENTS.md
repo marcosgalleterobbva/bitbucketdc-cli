@@ -80,6 +80,7 @@ These are accessed via `BitbucketClient.request_rest`, which uses the base REST 
 ## Output conventions
 
 - `--json` prints raw JSON for list/get operations.
+- `account me` is JSON by default and does not accept `--json`.
 - Diffs/patches are streamed as raw text (not JSON).
 - Tables are used for PR list and participant list; everything else is JSON or raw.
 

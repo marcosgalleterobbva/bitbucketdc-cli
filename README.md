@@ -94,6 +94,9 @@ bbdc account me
 # account me still returns partial JSON with "partial" + "errors"
 bbdc account me
 
+# account me is JSON by default; there is no --json flag
+# (use: bbdc account me)
+
 # include user profile and settings when your slug is known
 bbdc account me --user-slug your.user --include-settings
 
