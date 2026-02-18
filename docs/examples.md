@@ -8,6 +8,9 @@ These examples use a fictional project `GL_KAIF_APP-ID-2866825_DSG` and repo `me
 # Consolidated account snapshot (recent repos, SSH keys, GPG keys)
 bbdc account me
 
+# Show partial/error structure explicitly
+bbdc account me --json
+
 # Include profile/settings when your slug is known
 bbdc account me --user-slug alice --include-settings
 

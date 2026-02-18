@@ -12,7 +12,7 @@ Admin/system endpoints (permissions, security, mirroring, etc.) are out of scope
 Required environment variables:
 
 - `BITBUCKET_SERVER`: base REST URL ending in `/rest`
-- `BITBUCKET_API_TOKEN`: Bitbucket PAT
+- `BITBUCKET_API_TOKEN`: Bitbucket token (PAT or HTTP access token; BBVA commonly uses HTTP access tokens)
 
 Sanity check:
 

@@ -29,6 +29,14 @@ bbdc account me [--user-slug <slug>]
                 [--limit N] [--max-items N]
 ```
 
+Token behavior (BBVA):
+- Project/Repository HTTP access tokens may return `401` for user-account endpoints:
+  `account ssh-keys`, `account gpg-keys`, `account user`, `account settings`.
+- `account me` is tolerant of these failures and can return partial JSON with:
+  - `partial: true`
+  - `errors` (failed sections and messages)
+  - `notes` (token guidance)
+
 For `account user`, `account settings`, and profile/settings expansion in `account me`, user slug is resolved from:
 - `--user-slug`
 - `BITBUCKET_USER_SLUG`

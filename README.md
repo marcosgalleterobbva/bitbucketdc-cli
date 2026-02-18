@@ -41,7 +41,11 @@ pipx uninstall bbdc-cli
 The CLI uses two environment variables:
 
 - `BITBUCKET_SERVER`: base REST URL ending in `/rest`
-- `BITBUCKET_API_TOKEN`: Bitbucket personal access token (PAT)
+- `BITBUCKET_API_TOKEN`: Bitbucket token (PAT or HTTP access token)
+
+BBVA note:
+- Most users will authenticate with Project/Repository HTTP access tokens.
+- Those tokens usually work for repository/project workflows, but some user-account endpoints can return `401`.
 
 Example (BBVA-style context path):
 
@@ -85,6 +89,10 @@ Get information about your authenticated account:
 ```bash
 # consolidated snapshot (recent repos + SSH keys + GPG keys)
 bbdc account me
+
+# if some account endpoints are not permitted with your token,
+# account me returns partial JSON with "partial" + "errors"
+bbdc account me --json
 
 # include user profile and settings when your slug is known
 bbdc account me --user-slug your.user --include-settings
@@ -236,6 +244,9 @@ Unauthorized / 401 / 403:
 - Token missing or incorrect
 - Token lacks required permissions for that project/repo
 - Your Bitbucket instance may require a different auth scheme (rare if PAT is enabled)
+- In BBVA, Project/Repository HTTP access tokens may return `401` on user-account endpoints
+  (`account ssh-keys`, `account gpg-keys`, `account user`, `account settings`)
+- `account me` now returns partial results when some account endpoints are unauthorized; inspect `errors` in output
 
 404 Not Found:
 

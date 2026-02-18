@@ -420,6 +420,21 @@ def _resolve_user_slug(user_slug: Optional[str]) -> str:
     )
 
 
+def _account_http_token_hint() -> str:
+    return (
+        "BBVA token note: Project/Repository HTTP access tokens may not have permission for "
+        "user-account endpoints (ssh keys, gpg keys, user profile/settings). "
+        "This is different from repository/project PR operations."
+    )
+
+
+def _format_account_error(error: BBError) -> str:
+    message = str(error)
+    if message.startswith("HTTP 401"):
+        return f"{message}\nHint: {_account_http_token_hint()}"
+    return message
+
+
 ROLE_CHOICES = {"AUTHOR", "REVIEWER", "PARTICIPANT"}
 STATUS_CHOICES = {"UNAPPROVED", "NEEDS_WORK", "APPROVED"}
 COMMENT_STATE_CHOICES = {"OPEN", "RESOLVED"}
@@ -1283,19 +1298,52 @@ def _op_account_me(
     limit: int,
     max_items: int,
 ) -> Dict[str, Any]:
-    recent_repos = _op_account_recent_repos(bb, limit=limit, max_items=max_items)["data"]
-    ssh_keys = _op_account_ssh_keys(bb, user=None, limit=limit, max_items=max_items)["data"]
-    gpg_keys = _op_account_gpg_keys(bb, user=None, limit=limit, max_items=max_items)["data"]
+    errors: Dict[str, str] = {}
+
+    def collect_list(
+        key: str,
+        getter,
+    ) -> List[Dict[str, Any]]:
+        try:
+            return getter()["data"]
+        except BBError as e:
+            errors[key] = _format_account_error(e)
+            return []
+
+    recent_repos = collect_list(
+        "recent_repositories",
+        lambda: _op_account_recent_repos(bb, limit=limit, max_items=max_items),
+    )
+    ssh_keys = collect_list(
+        "ssh_keys",
+        lambda: _op_account_ssh_keys(bb, user=None, limit=limit, max_items=max_items),
+    )
+    gpg_keys = collect_list(
+        "gpg_keys",
+        lambda: _op_account_gpg_keys(bb, user=None, limit=limit, max_items=max_items),
+    )
 
     resolved_user_slug: Optional[str] = None
     user_profile: Optional[Dict[str, Any]] = None
     user_settings: Optional[Dict[str, Any]] = None
     if include_profile or include_settings:
-        resolved_user_slug = _resolve_user_slug(user_slug)
-        if include_profile:
-            user_profile = _op_account_user(bb, resolved_user_slug)["data"]
-        if include_settings:
-            user_settings = _op_account_user_settings(bb, resolved_user_slug)["data"]
+        try:
+            resolved_user_slug = _resolve_user_slug(user_slug)
+        except BBError as e:
+            errors["resolved_user_slug"] = _format_account_error(e)
+            resolved_user_slug = None
+
+        if resolved_user_slug:
+            if include_profile:
+                try:
+                    user_profile = _op_account_user(bb, resolved_user_slug)["data"]
+                except BBError as e:
+                    errors["user"] = _format_account_error(e)
+            if include_settings:
+                try:
+                    user_settings = _op_account_user_settings(bb, resolved_user_slug)["data"]
+                except BBError as e:
+                    errors["settings"] = _format_account_error(e)
 
     payload: Dict[str, Any] = {
         "counts": {
@@ -1313,6 +1361,17 @@ def _op_account_me(
         payload["user"] = user_profile
     if user_settings is not None:
         payload["settings"] = user_settings
+    if errors:
+        payload["partial"] = True
+        payload["errors"] = errors
+        payload["notes"] = [
+            "Some account endpoints were not accessible with the current token.",
+            _account_http_token_hint(),
+        ]
+        return {
+            "message": f"Fetched partial authenticated account information ({len(errors)} section(s) failed)",
+            "data": payload,
+        }
 
     return {"message": "Fetched authenticated account information", "data": payload}
 
@@ -1596,7 +1655,10 @@ def account_recent_repos(
 ):
     """Get recently accessed repositories for the authenticated user."""
     bb = client()
-    resp = _op_account_recent_repos(bb, limit=limit, max_items=max_items)
+    try:
+        resp = _op_account_recent_repos(bb, limit=limit, max_items=max_items)
+    except BBError as e:
+        raise BBError(_format_account_error(e))
     if json_out:
         _print_json(resp["data"])
     else:
@@ -1612,7 +1674,10 @@ def account_ssh_keys(
 ):
     """Get SSH keys for the authenticated user (or another user with sufficient permissions)."""
     bb = client()
-    resp = _op_account_ssh_keys(bb, user=user, limit=limit, max_items=max_items)
+    try:
+        resp = _op_account_ssh_keys(bb, user=user, limit=limit, max_items=max_items)
+    except BBError as e:
+        raise BBError(_format_account_error(e))
     if json_out:
         _print_json(resp["data"])
     else:
@@ -1628,7 +1693,10 @@ def account_gpg_keys(
 ):
     """Get GPG keys for the authenticated user (or another user with sufficient permissions)."""
     bb = client()
-    resp = _op_account_gpg_keys(bb, user=user, limit=limit, max_items=max_items)
+    try:
+        resp = _op_account_gpg_keys(bb, user=user, limit=limit, max_items=max_items)
+    except BBError as e:
+        raise BBError(_format_account_error(e))
     if json_out:
         _print_json(resp["data"])
     else:
@@ -1645,8 +1713,11 @@ def account_user(
 ):
     """Get user details for the authenticated user account (or a supplied user slug)."""
     bb = client()
-    slug = _resolve_user_slug(user_slug)
-    resp = _op_account_user(bb, slug)
+    try:
+        slug = _resolve_user_slug(user_slug)
+        resp = _op_account_user(bb, slug)
+    except BBError as e:
+        raise BBError(_format_account_error(e))
     _print_json(resp["data"])
 
 
@@ -1660,8 +1731,11 @@ def account_settings(
 ):
     """Get account settings for the authenticated user account (or a supplied user slug)."""
     bb = client()
-    slug = _resolve_user_slug(user_slug)
-    resp = _op_account_user_settings(bb, slug)
+    try:
+        slug = _resolve_user_slug(user_slug)
+        resp = _op_account_user_settings(bb, slug)
+    except BBError as e:
+        raise BBError(_format_account_error(e))
     _print_json(resp["data"])
 
 
@@ -1685,7 +1759,10 @@ def account_me(
     limit: int = typer.Option(25, help="Page size for account-related paged endpoints"),
     max_items: int = typer.Option(100, help="Max items per account-related endpoint"),
 ):
-    """Get a consolidated snapshot of the authenticated account (repos, SSH keys, GPG keys)."""
+    """Get a consolidated snapshot of the authenticated account.
+
+    This command returns partial data when some account endpoints are unauthorized for the token in use.
+    """
     bb = client()
     resp = _op_account_me(
         bb,
