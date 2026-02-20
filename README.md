@@ -81,6 +81,7 @@ Show help:
 ```bash
 bbdc --help
 bbdc account --help
+bbdc dashboard --help
 bbdc pr --help
 ```
 
@@ -106,6 +107,19 @@ bbdc account ssh-keys
 bbdc account gpg-keys
 bbdc account user --user-slug your.user
 bbdc account settings --user-slug your.user
+```
+
+Inspect dashboard pull requests:
+
+```bash
+# pull requests where you are involved (author/reviewer/participant)
+bbdc dashboard pull-requests
+
+# filter by role/state
+bbdc dashboard pull-requests --role REVIEWER --state OPEN
+
+# return JSON
+bbdc dashboard pull-requests --json
 ```
 
 List pull requests:

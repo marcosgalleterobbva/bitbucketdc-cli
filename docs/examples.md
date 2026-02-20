@@ -22,6 +22,19 @@ bbdc account user --user-slug alice
 bbdc account settings --user-slug alice
 ```
 
+## Inspect dashboard pull requests
+
+```bash
+# Dashboard PRs for the authenticated user
+bbdc dashboard pull-requests
+
+# Filter dashboard PRs by role/state
+bbdc dashboard pull-requests --role REVIEWER --state OPEN
+
+# Include only recently closed PRs from last 24h and print JSON
+bbdc dashboard pull-requests --state MERGED --closed-since 86400 --json
+```
+
 ## Review a PR end-to-end
 
 ```bash

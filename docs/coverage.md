@@ -98,7 +98,7 @@ Below are the endpoints implemented in `bbdc_cli/__main__.py` that map to contri
 
 - `GET /api/latest/projects/{projectKey}/repos/{repositorySlug}/commits/{commitId}/pull-requests`
 
-### Dashboard sanity check
+### Dashboard
 
 - `GET /api/latest/dashboard/pull-requests`
 
@@ -135,4 +135,3 @@ Examples of intentionally excluded areas:
 - Mirroring and synchronization
 - Global authentication administration
 - Project and repo administration (hooks, webhooks, restrictions)
-

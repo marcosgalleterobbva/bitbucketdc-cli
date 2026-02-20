@@ -29,6 +29,7 @@ Codex runtime caveat:
 Top-level:
 
 - `bbdc doctor`
+- `bbdc dashboard pull-requests`
 - `bbdc account me|recent-repos|ssh-keys|gpg-keys|user|settings`
 
 Pull requests:

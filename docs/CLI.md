@@ -10,6 +10,17 @@ Global:
 bbdc doctor [--json]
 ```
 
+Dashboard:
+
+```
+bbdc dashboard pull-requests [--user <name>] [--state OPEN|DECLINED|MERGED]
+                             [--role REVIEWER|AUTHOR|PARTICIPANT]
+                             [--participant-status <csv>]
+                             [--order <csv>]
+                             [--closed-since N]
+                             [--limit N] [--max-items N] [--json]
+```
+
 Account:
 
 ```

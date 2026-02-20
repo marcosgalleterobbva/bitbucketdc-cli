@@ -37,6 +37,7 @@ import typer
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
 account_app = typer.Typer(no_args_is_help=True, add_completion=False)
+dashboard_app = typer.Typer(no_args_is_help=True, add_completion=False)
 pr_app = typer.Typer(no_args_is_help=True, add_completion=False)
 participants_app = typer.Typer(no_args_is_help=True, add_completion=False)
 comments_app = typer.Typer(no_args_is_help=True, add_completion=False)
@@ -44,6 +45,7 @@ blockers_app = typer.Typer(no_args_is_help=True, add_completion=False)
 review_app = typer.Typer(no_args_is_help=True, add_completion=False)
 auto_merge_app = typer.Typer(no_args_is_help=True, add_completion=False)
 app.add_typer(account_app, name="account", help="Authenticated account operations")
+app.add_typer(dashboard_app, name="dashboard", help="Dashboard operations")
 app.add_typer(pr_app, name="pr", help="Pull request operations")
 pr_app.add_typer(participants_app, name="participants", help="PR participants and reviewers")
 pr_app.add_typer(comments_app, name="comments", help="PR comments")
@@ -1252,6 +1254,41 @@ def _op_pr_auto_merge_cancel(
     return {"message": f"Cancelled auto-merge for PR #{pr_id}"}
 
 
+def _op_dashboard_pull_requests(
+    bb: BitbucketClient,
+    *,
+    user: Optional[str],
+    state: Optional[str],
+    role: Optional[str],
+    participant_status: Optional[str],
+    order: Optional[str],
+    closed_since: Optional[int],
+    limit: int,
+    max_items: int,
+) -> Dict[str, Any]:
+    params: Dict[str, Any] = {}
+    if user:
+        params["user"] = user
+    if state:
+        params["state"] = state
+    if role:
+        params["role"] = role
+    if participant_status:
+        params["participantStatus"] = participant_status
+    if order:
+        params["order"] = order
+    if closed_since is not None:
+        params["closedSince"] = closed_since
+    prs = bb.paged_get(
+        "dashboard/pull-requests",
+        params=params or None,
+        limit=limit,
+        max_items=max_items,
+    )
+    who = user or "current user"
+    return {"message": f"Fetched {len(prs)} dashboard pull requests for {who}", "data": prs}
+
+
 def _op_account_recent_repos(
     bb: BitbucketClient, limit: int, max_items: int
 ) -> Dict[str, Any]:
@@ -1773,6 +1810,57 @@ def account_me(
         max_items=max_items,
     )
     _print_json(resp["data"])
+
+
+@dashboard_app.command("pull-requests")
+def dashboard_pull_requests(
+    user: Optional[str] = typer.Option(None, "--user", help="Involved user name; defaults to current user"),
+    state: Optional[str] = typer.Option(
+        None,
+        "--state",
+        help="OPEN, DECLINED, or MERGED. Omit to include all states.",
+    ),
+    role: Optional[str] = typer.Option(
+        None,
+        "--role",
+        help="REVIEWER, AUTHOR, or PARTICIPANT. Omit to include all roles.",
+    ),
+    participant_status: Optional[str] = typer.Option(
+        None,
+        "--participant-status",
+        help="Comma-separated list: UNAPPROVED, NEEDS_WORK, APPROVED.",
+    ),
+    order: Optional[str] = typer.Option(
+        None,
+        "--order",
+        help="OLDEST, NEWEST, DRAFT_STATUS, PARTICIPANT_STATUS, and/or CLOSED_DATE.",
+    ),
+    closed_since: Optional[int] = typer.Option(
+        None,
+        "--closed-since",
+        help="Only include PRs closed in the last N seconds.",
+    ),
+    limit: int = typer.Option(25, help="Page size"),
+    max_items: int = typer.Option(100, help="Max items to fetch across pages"),
+    json_out: bool = typer.Option(False, "--json", help="Print raw JSON instead of a table"),
+):
+    """List dashboard pull requests for a user."""
+    bb = client()
+    resp = _op_dashboard_pull_requests(
+        bb,
+        user=user,
+        state=state,
+        role=role,
+        participant_status=participant_status,
+        order=order,
+        closed_since=closed_since,
+        limit=limit,
+        max_items=max_items,
+    )
+    if json_out:
+        _print_json(resp["data"])
+    else:
+        _print_prs(resp["data"])
 
 
 @pr_app.command("list")
